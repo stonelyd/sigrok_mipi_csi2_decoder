@@ -112,14 +112,20 @@ class Decoder(srd.Decoder):
     # Channel definitions
     channels = (
         {'id': 'clk_p', 'name': 'CLK_P', 'desc': 'Clock lane positive'},
+        {'id': 'clk_n', 'name': 'CLK_N', 'desc': 'Clock lane negative'},
         {'id': 'data0_p', 'name': 'DATA0_P', 'desc': 'Data lane 0 positive'},
+        {'id': 'data0_n', 'name': 'DATA0_N', 'desc': 'Data lane 0 negative'},
+
     )
 
     # Optional channels (can be None)
     optional_channels = (
         {'id': 'data1_p', 'name': 'DATA1_P', 'desc': 'Data lane 1 positive (optional)'},
+        {'id': 'data1_n', 'name': 'DATA1_N', 'desc': 'Data lane 1 negative (optional)'},
         {'id': 'data2_p', 'name': 'DATA2_P', 'desc': 'Data lane 2 positive (optional)'},
+        {'id': 'data2_n', 'name': 'DATA2_N', 'desc': 'Data lane 2 negative (optional)'},
         {'id': 'data3_p', 'name': 'DATA3_P', 'desc': 'Data lane 3 positive (optional)'},
+        {'id': 'data3_n', 'name': 'DATA3_N', 'desc': 'Data lane 3 negative (optional)'},
     )
 
     # Decoder options
@@ -218,16 +224,7 @@ class Decoder(srd.Decoder):
             self.num_lanes = 0  # Auto-detect
             self.expected_bitrate = 1000
 
-        # Add a test annotation to verify decoder is working
-        self.putg(0, 1000, 0, 'MIPI CSI-2 D-PHY Decoder Started')
-
-        # Add a more prominent test annotation for lane states
-        self.putg(10000, 12000, 10, 'LANE STATE TEST - Should be visible')
-
-        # Add very prominent test annotations that should definitely be visible
-        self.putg(5000, 15000, 10, 'VERY LONG LANE STATE TEST')
-        self.putg(5000, 15000, 11, 'VERY LONG LANE COUNT TEST')
-        self.putg(5000, 15000, 12, 'VERY LONG BIT SHIFT TEST')
+            self.putg(0, 1000, 0, 'MIPI CSI-2 D-PHY Decoder Started')
 
     def putg(self, ss, es, cls, text):
         self.put(ss, es, self.out_ann, [cls, [text]])
@@ -238,36 +235,65 @@ class Decoder(srd.Decoder):
     def putb(self, ss, es, data):
         self.put(ss, es, self.out_binary, data)
 
-    def detect_lane_state(self, lane, data_p, data_n=None):
-        """Detect the state of a lane based on signals"""
+    def detect_lane_state(self, lane, data_p, data_n):
+        """Detect D-PHY lane state based on differential signals"""
         if data_p is None:
             return None
 
-        # For MIPI CSI-2 with single-ended signals, we need to be more careful
-        # Static signals (high or low) should be treated as LP state
-        # Only consider HS state when we see actual transitions
+        # Handle missing data_n (single-ended fallback)
+        if data_n is None:
+            data_n = 0  # Assume data_n=0 for single-ended signals
 
-        # Store the previous signal value for this lane
-        if not hasattr(self, 'lane_prev_signal'):
-            self.lane_prev_signal = [None] * 4
+        # Initialize tracking state
+        if not hasattr(self, 'lane_prev_state'):
+            self.lane_prev_state = [LANE_STATE_LP_11] * 4
+            self.lane_stable_samples = [0] * 4
+            self.lane_hs_transition_count = [0] * 4
 
-        # If this is the first sample for this lane, assume LP state
-        if self.lane_prev_signal[lane] is None:
-            self.lane_prev_signal[lane] = data_p
-            return LANE_STATE_LP_11
-
-        # Check if the signal has changed (indicating HS activity)
-        if self.lane_prev_signal[lane] != data_p:
-            # Signal changed - this indicates HS activity
-            self.lane_prev_signal[lane] = data_p
-            if data_p == 1:
-                return LANE_STATE_HS_1
-            else:
-                return LANE_STATE_HS_0
+        # Determine current D-PHY state based on differential pair
+        if data_p == 1 and data_n == 1:
+            current_state = LANE_STATE_LP_11  # Stop state
+        elif data_p == 0 and data_n == 1:
+            current_state = LANE_STATE_LP_01  # Turnaround
+        elif data_p == 0 and data_n == 0:
+            current_state = LANE_STATE_LP_00  # Turnaround
+        elif data_p == 1 and data_n == 0:
+            current_state = LANE_STATE_LP_10  # Turnaround
         else:
-            # Signal hasn't changed - this is likely LP state
-            self.lane_prev_signal[lane] = data_p
-            return LANE_STATE_LP_11
+            # Invalid state - should not happen with proper differential signals
+            current_state = LANE_STATE_LP_11
+
+        prev_state = self.lane_prev_state[lane]
+
+        # Detect HS (High Speed) mode by rapid state changes
+        # HS mode is characterized by fast differential transitions
+        if current_state != prev_state:
+            self.lane_stable_samples[lane] = 0
+
+            # If transitioning rapidly between LP states, it's actually HS mode
+            if (prev_state in [LANE_STATE_LP_01, LANE_STATE_LP_10] or
+                current_state in [LANE_STATE_LP_01, LANE_STATE_LP_10]):
+                self.lane_hs_transition_count[lane] += 1
+
+                # After several transitions, treat as HS data
+                if self.lane_hs_transition_count[lane] >= 3:
+                    # Determine HS state based on differential
+                    if data_p > data_n:
+                        self.lane_prev_state[lane] = LANE_STATE_HS_1
+                        return LANE_STATE_HS_1
+                    else:
+                        self.lane_prev_state[lane] = LANE_STATE_HS_0
+                        return LANE_STATE_HS_0
+        else:
+            # Stable signal
+            self.lane_stable_samples[lane] += 1
+
+            # Reset HS counter if signal is stable for a while
+            if self.lane_stable_samples[lane] > 10:
+                self.lane_hs_transition_count[lane] = 0
+
+        self.lane_prev_state[lane] = current_state
+        return current_state
 
     def update_lane_state(self, lane, new_state, ss):
         """Update lane state and annotate if changed"""
@@ -276,16 +302,20 @@ class Decoder(srd.Decoder):
 
         if self.lane_states[lane] != new_state:
             old_state = self.lane_states[lane]
+            old_start = self.lane_state_start[lane]
+
+            # Annotate the previous state duration
+            if old_start is not None:
+                self.putg(old_start, ss, 10, f'L{lane}: {old_state}')
+
+            # Update state tracking
             self.lane_states[lane] = new_state
             self.lane_state_start[lane] = ss
+            self.putp(ss, ss, ['LANE_STATE', [lane, new_state]])
 
-                                                # Annotate state change - make it more visible with longer duration
-            self.putg(self.lane_state_start[lane], ss + 1000, 10, f'Lane{lane}: {old_state}→{new_state}')
-            self.putp(self.lane_state_start[lane], ss, ['LANE_STATE', [lane, new_state]])
-
-            # Also add a more visible annotation for significant state changes
-            if new_state in [LANE_STATE_HS_0, LANE_STATE_HS_1]:
-                self.putg(self.lane_state_start[lane], ss + 2000, 2, f'Lane{lane} HS: {new_state}')
+            # Add transition marker for HS start
+            if new_state in [LANE_STATE_HS_0, LANE_STATE_HS_1] and old_state == LANE_STATE_LP_11:
+                self.putg(ss, ss + 10, 2, f'L{lane} HS Start')
 
             # Track transitions to HS state for lane detection
             if new_state in [LANE_STATE_HS_0, LANE_STATE_HS_1, LANE_STATE_HS_SYNC]:
@@ -327,12 +357,12 @@ class Decoder(srd.Decoder):
             return
 
         # Shift in the new bit (LSB first - MIPI CSI-2 standard)
-        # For LSB first: new bit goes to the rightmost position
         self.bit_shifters[lane] = (self.bit_shifters[lane] >> 1) | (bit_value << 7)
         self.bit_counters[lane] += 1
 
-        # Annotate bit shifting
-        self.putg(ss, ss + 1, 12, f'Lane{lane}: {bit_value}')
+        # Only annotate every 8th bit to reduce clutter
+        if self.bit_counters[lane] % 8 == 0:
+            self.putg(ss - 7, ss + 1, 12, f'L{lane}: byte')
 
         # Check for sync byte when we have 8 bits
         if self.bit_counters[lane] >= 8:
@@ -463,35 +493,41 @@ class Decoder(srd.Decoder):
     def decode(self):
         """Main decode function with state machine and serial bit shifting"""
         while True:
-            # Wait for clock edge on clk_p
-            pins = self.wait({0: 'e'})
+            # Wait for any signal change, not just clock edges
+            pins = self.wait({0: 'e'})  # Wait for clock edge
+            ss = self.samplenum // 280
+            print(f"DEBUG: Sample {ss}, Pins: {pins}")
 
-            # Extract the channels we need (simplified for positive signals only)
-            if len(pins) >= 5:
-                clk_p, data0_p, data1_p, data2_p, data3_p = pins[0:5]
-            else:
-                # Fallback if fewer channels are available
-                clk_p = pins[0] if len(pins) > 0 else None
-                data0_p = pins[1] if len(pins) > 1 else None
-                data1_p = pins[2] if len(pins) > 2 else None
-                data2_p = pins[3] if len(pins) > 3 else None
-                data3_p = pins[4] if len(pins) > 4 else None
+
+            # Extract differential channels (clk_p, clk_n, data0_p, data0_n, ...)
+            clk_p = pins[0] if len(pins) > 0 else None
+            clk_n = pins[1] if len(pins) > 1 else None
+            data0_p = pins[2] if len(pins) > 2 else None
+            data0_n = pins[3] if len(pins) > 3 else None
+            data1_p = pins[4] if len(pins) > 4 else None
+            data1_n = pins[5] if len(pins) > 5 else None
+            data2_p = pins[6] if len(pins) > 6 else None
+            data2_n = pins[7] if len(pins) > 7 else None
+            data3_p = pins[8] if len(pins) > 8 else None
+            data3_n = pins[9] if len(pins) > 9 else None
 
             # Process each lane
-            data_lanes = [data0_p, data1_p, data2_p, data3_p]
+            data_lanes_p = [data0_p, data1_p, data2_p, data3_p]
+            data_lanes_n = [data0_n, data1_n, data2_n, data3_n]
 
             for lane in range(4):
-                data_p = data_lanes[lane]
+                data_p = data_lanes_p[lane]
+                data_n = data_lanes_n[lane]
                 if data_p is not None:
                     # Detect lane state using single-ended signals
-                    lane_state = self.detect_lane_state(lane, data_p)
-                    self.update_lane_state(lane, lane_state, self.samplenum)
+                    lane_state = self.detect_lane_state(lane, data_p, data_n)
+                    self.update_lane_state(lane, lane_state, ss)
                     # print(f"DEBUG: Lane {lane} state: {lane_state}")
 
                     # If in HS state, shift bits (process on all lanes to detect sync)
                     if lane_state in [LANE_STATE_HS_0, LANE_STATE_HS_1]:
                         bit_value = 1 if lane_state == LANE_STATE_HS_1 else 0
-                        self.shift_bits(lane, bit_value, self.samplenum)
+                        self.shift_bits(lane, bit_value, ss)
 
             # Use detected lane count if auto-detect is enabled
             active_lanes = self.detected_lanes if self.num_lanes == 0 else self.num_lanes
