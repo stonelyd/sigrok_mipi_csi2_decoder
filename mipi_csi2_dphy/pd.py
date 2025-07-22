@@ -56,8 +56,8 @@ LANE_STATE_LP_11 = 'LP-11'  # Low Power Stop state
 LANE_STATE_LP_01 = 'LP-01'  # Low Power Turn-around
 LANE_STATE_LP_00 = 'LP-00'  # Low Power Turn-around
 LANE_STATE_LP_10 = 'LP-10'  # Low Power Turn-around
-LANE_STATE_HS_0 = 'HS-0'    # High Speed Data 0
-LANE_STATE_HS_1 = 'HS-1'    # High Speed Data 1
+LANE_STATE_THS_SETTLE = 'THS-SETTLE'  # High Speed Settle (custom state)
+LANE_STATE_HS = 'HS'        # High Speed Data
 LANE_STATE_HS_SYNC = 'HS-SYNC'  # High Speed Sync
 
 # CSI-2 Data Types (most common ones)
@@ -111,21 +111,20 @@ class Decoder(srd.Decoder):
 
     # Channel definitions
     channels = (
-        {'id': 'clk_p', 'name': 'CLK_P', 'desc': 'Clock lane positive'},
         {'id': 'clk_n', 'name': 'CLK_N', 'desc': 'Clock lane negative'},
-        {'id': 'data0_p', 'name': 'DATA0_P', 'desc': 'Data lane 0 positive'},
+        {'id': 'clk_p', 'name': 'CLK_P', 'desc': 'Clock lane positive'},
         {'id': 'data0_n', 'name': 'DATA0_N', 'desc': 'Data lane 0 negative'},
-
+        {'id': 'data0_p', 'name': 'DATA0_P', 'desc': 'Data lane 0 positive'},
     )
 
     # Optional channels (can be None)
     optional_channels = (
-        {'id': 'data1_p', 'name': 'DATA1_P', 'desc': 'Data lane 1 positive (optional)'},
         {'id': 'data1_n', 'name': 'DATA1_N', 'desc': 'Data lane 1 negative (optional)'},
-        {'id': 'data2_p', 'name': 'DATA2_P', 'desc': 'Data lane 2 positive (optional)'},
+        {'id': 'data1_p', 'name': 'DATA1_P', 'desc': 'Data lane 1 positive (optional)'},
         {'id': 'data2_n', 'name': 'DATA2_N', 'desc': 'Data lane 2 negative (optional)'},
-        {'id': 'data3_p', 'name': 'DATA3_P', 'desc': 'Data lane 3 positive (optional)'},
+        {'id': 'data2_p', 'name': 'DATA2_P', 'desc': 'Data lane 2 positive (optional)'},
         {'id': 'data3_n', 'name': 'DATA3_N', 'desc': 'Data lane 3 negative (optional)'},
+        {'id': 'data3_p', 'name': 'DATA3_P', 'desc': 'Data lane 3 positive (optional)'},
     )
 
     # Decoder options
@@ -209,7 +208,7 @@ class Decoder(srd.Decoder):
     def metadata(self, key, value):
         if key == srd.SRD_CONF_SAMPLERATE:
             self.samplerate = value
-            print(f"DEBUG: Received samplerate = {value} Hz from sigrok")
+            pass  # print(f"DEBUG: Received samplerate = {value} Hz from sigrok")
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -237,7 +236,7 @@ class Decoder(srd.Decoder):
         self.put(ss, es, self.out_binary, data)
 
     def detect_lane_state(self, lane, data_p, data_n):
-        """Detect D-PHY lane state based on differential signals"""
+        """Detect D-PHY lane state with THS-SETTLE and simplified HS detection"""
         if data_p is None:
             return None
 
@@ -248,53 +247,71 @@ class Decoder(srd.Decoder):
         # Initialize tracking state
         if not hasattr(self, 'lane_prev_state'):
             self.lane_prev_state = [LANE_STATE_LP_11] * 4
-            self.lane_stable_samples = [0] * 4
-            self.lane_hs_transition_count = [0] * 4
-
-        # Determine current D-PHY state based on differential pair
-        if data_p == 1 and data_n == 1:
-            current_state = LANE_STATE_LP_11  # Stop state
-        elif data_p == 0 and data_n == 1:
-            current_state = LANE_STATE_LP_01  # Turnaround
-        elif data_p == 0 and data_n == 0:
-            current_state = LANE_STATE_LP_00  # Turnaround
-        elif data_p == 1 and data_n == 0:
-            current_state = LANE_STATE_LP_10  # Turnaround
-        else:
-            # Invalid state - should not happen with proper differential signals
-            current_state = LANE_STATE_LP_11
+            self.lane_in_ths_settle = [False] * 4
+            self.lane_sync_detected = [False] * 4
+            self.lane_was_lp00 = [False] * 4
 
         prev_state = self.lane_prev_state[lane]
 
-        # Detect HS (High Speed) mode by rapid state changes
-        # HS mode is characterized by fast differential transitions
-        if current_state != prev_state:
-            self.lane_stable_samples[lane] = 0
-
-            # If transitioning rapidly between LP states, it's actually HS mode
-            if (prev_state in [LANE_STATE_LP_01, LANE_STATE_LP_10] or
-                current_state in [LANE_STATE_LP_01, LANE_STATE_LP_10]):
-                self.lane_hs_transition_count[lane] += 1
-
-                # After several transitions, treat as HS data
-                if self.lane_hs_transition_count[lane] >= 3:
-                    # Determine HS state based on differential
-                    if data_p > data_n:
-                        self.lane_prev_state[lane] = LANE_STATE_HS_1
-                        return LANE_STATE_HS_1
-                    else:
-                        self.lane_prev_state[lane] = LANE_STATE_HS_0
-                        return LANE_STATE_HS_0
+        # Determine current physical state based on differential pair
+        if data_p == 1 and data_n == 1:
+            physical_state = LANE_STATE_LP_11  # Stop state
+        elif data_p == 0 and data_n == 1:
+            physical_state = LANE_STATE_LP_01  # Turnaround
+        elif data_p == 0 and data_n == 0:
+            physical_state = LANE_STATE_LP_00  # Turnaround
+        elif data_p == 1 and data_n == 0:
+            physical_state = LANE_STATE_LP_10  # Turnaround
         else:
-            # Stable signal
-            self.lane_stable_samples[lane] += 1
+            # Invalid state - should not happen with proper differential signals
+            physical_state = LANE_STATE_LP_11
 
-            # Reset HS counter if signal is stable for a while
-            if self.lane_stable_samples[lane] > 10:
-                self.lane_hs_transition_count[lane] = 0
+        # State machine logic with THS-SETTLE
 
-        self.lane_prev_state[lane] = current_state
-        return current_state
+        # 1. Return to LP-11 from any state
+        if physical_state == LANE_STATE_LP_11:
+            self.lane_in_ths_settle[lane] = False
+            self.lane_sync_detected[lane] = False
+            self.lane_prev_state[lane] = LANE_STATE_LP_11
+            return LANE_STATE_LP_11
+
+        # 2. Track LP-00 state for THS-SETTLE detection
+        if physical_state == LANE_STATE_LP_00:
+            self.lane_was_lp00[lane] = True
+        elif physical_state == LANE_STATE_LP_11:
+            self.lane_was_lp00[lane] = False
+
+        # 3. Transition to THS-SETTLE when leaving LP-00 after the sequence
+        if (prev_state == LANE_STATE_LP_00 and physical_state != LANE_STATE_LP_00 and
+            self.lane_was_lp00[lane]):
+            self.lane_in_ths_settle[lane] = True
+            self.lane_was_lp00[lane] = False  # Reset flag
+            self.lane_prev_state[lane] = LANE_STATE_THS_SETTLE
+            return LANE_STATE_THS_SETTLE
+
+        # 4. Stay in THS-SETTLE until sync detected
+        if self.lane_in_ths_settle[lane]:
+            # Check if sync has been detected (will be set by sync detection logic)
+            if self.lane_sync_detected[lane]:
+                self.lane_in_ths_settle[lane] = False
+                self.lane_prev_state[lane] = LANE_STATE_HS
+                return LANE_STATE_HS
+            else:
+                # Stay in THS-SETTLE regardless of physical state
+                return LANE_STATE_THS_SETTLE
+
+        # 5. If in HS mode, only exit when returning to LP-11
+        if prev_state == LANE_STATE_HS:
+            if physical_state == LANE_STATE_LP_11:
+                # Already handled above
+                pass
+            else:
+                # Stay in HS mode
+                return LANE_STATE_HS
+
+        # 6. Default: follow physical state for normal LP states
+        self.lane_prev_state[lane] = physical_state
+        return physical_state
 
     def update_lane_state(self, lane, new_state, ss):
         """Update lane state and annotate if changed"""
@@ -315,11 +332,11 @@ class Decoder(srd.Decoder):
             self.putp(ss, ss, ['LANE_STATE', [lane, new_state]])
 
             # Add transition marker for HS start
-            if new_state in [LANE_STATE_HS_0, LANE_STATE_HS_1] and old_state == LANE_STATE_LP_11:
+            if new_state == LANE_STATE_HS and old_state == LANE_STATE_LP_11:
                 self.putg(ss, ss + 10, 2, f'L{lane} HS Start')
 
             # Track transitions to HS state for lane detection
-            if new_state in [LANE_STATE_HS_0, LANE_STATE_HS_1, LANE_STATE_HS_SYNC]:
+            if new_state in [LANE_STATE_HS, LANE_STATE_HS_SYNC]:
                 self.lane_transition_count[lane] += 1
 
                 # Record when lane first started showing activity
@@ -348,7 +365,7 @@ class Decoder(srd.Decoder):
 
         if active_lanes != self.detected_lanes:
             self.detected_lanes = active_lanes
-            print(f"DEBUG: Detected {self.detected_lanes} active lanes: {', '.join(lane_details)}")
+            # print(f"DEBUG: Detected {self.detected_lanes} active lanes: {', '.join(lane_details)}")
             self.putg(self.samplenum, self.samplenum + 1, 11, f'Detected: {self.detected_lanes} lanes')
             self.putp(self.samplenum, self.samplenum + 1, ['LANE_COUNT', [self.detected_lanes]])
 
@@ -361,24 +378,28 @@ class Decoder(srd.Decoder):
         self.bit_shifters[lane] = (self.bit_shifters[lane] >> 1) | (bit_value << 7)
         self.bit_counters[lane] += 1
 
+        byte_value = self.bit_shifters[lane] & 0xFF
+        # print(f"DEBUG: Lane{lane}: Byte Value 0x{byte_value:02X}")
         # Only annotate every 8th bit to reduce clutter
-        if self.bit_counters[lane] % 8 == 0:
-            self.putg(ss - 7, ss + 1, 12, f'L{lane}: byte')
+        # if self.bit_counters[lane] % 8 == 0:
+        #     self.putg(ss - 7, ss + 1, 12, f'L{lane}: byte')
 
         # Check for sync byte when we have 8 bits
-        if self.bit_counters[lane] >= 8:
-            byte_value = self.bit_shifters[lane] & 0xFF
-            self.bit_shifters[lane] = 0
-            self.bit_counters[lane] = 0
+        # if self.bit_counters[lane] >= 8:
+        byte_value = self.bit_shifters[lane] & 0xFF
+            # self.bit_shifters[lane] = 0
+            # self.bit_counters[lane] = 0
 
-            print(f"DEBUG: Lane{lane}: 0x{byte_value:02X}")
-            # Check for sync byte (try both 0xAB and 0x55)
-            if (byte_value == SYNC_MARKER ) and not self.sync_detected[lane]:
-                self.sync_detected[lane] = True
-                self.lane_sync_detected[lane] = True  # Mark lane as having sync
-                self.putg(ss - 7, ss + 1, 13, f'Lane{lane}: SYNC 0x{byte_value:02X}')
-                self.putp(ss - 7, ss + 1, ['SYNC', None])
-                print(f"DEBUG: Sync byte detected on lane {lane}: 0x{byte_value:02X}")
+            # Debug sync detection if needed
+            # if byte_value == SYNC_MARKER:
+        print(f"-------------------------------------------------------------DEBUG: Lane{lane}: Byte Value 0x{byte_value:02X}")
+        # Check for sync byte (try both 0xAB and 0x55)
+        if (byte_value == SYNC_MARKER ) and not self.sync_detected[lane]:
+            self.sync_detected[lane] = True
+            self.lane_sync_detected[lane] = True  # Mark lane as having sync
+            self.putg(ss - 7, ss + 1, 13, f'Lane{lane}: SYNC 0x{byte_value:02X}')
+            self.putp(ss - 7, ss + 1, ['SYNC', None])
+            print(f"-----------------------------------DEBUG: Sync byte detected on lane {lane}: 0x{byte_value:02X}")
 
             # Add to byte buffer
             self.byte_buffers[lane].append(byte_value)
@@ -497,26 +518,20 @@ class Decoder(srd.Decoder):
             # Wait for any signal change, not just clock edges
             pins = self.wait({0: 'e'})  # Wait for clock edge
             ss = self.samplenum  # Test without scaling
-            print(f"DEBUG: RAW samplenum={self.samplenum}, SCALED sample={ss}, Pins: {pins}")
-            
-            # Test: put annotations at both positions to see which aligns
-            if self.samplenum == 10000:  # First VCD timestamp
-                self.putg(self.samplenum, self.samplenum + 100, 7, f'RAW@{self.samplenum}')
-                self.putg(ss, ss + 10, 7, f'SCALED@{ss}')
-                print(f"DEBUG: Put RAW annotation at {self.samplenum}, SCALED at {ss}")
+            # print(f"DEBUG: RAW samplenum={self.samplenum}, SCALED sample={ss}, Pins: {pins}")
 
 
             # Extract differential channels (clk_p, clk_n, data0_p, data0_n, ...)
-            clk_p = pins[0] if len(pins) > 0 else None
-            clk_n = pins[1] if len(pins) > 1 else None
-            data0_p = pins[2] if len(pins) > 2 else None
-            data0_n = pins[3] if len(pins) > 3 else None
-            data1_p = pins[4] if len(pins) > 4 else None
-            data1_n = pins[5] if len(pins) > 5 else None
-            data2_p = pins[6] if len(pins) > 6 else None
-            data2_n = pins[7] if len(pins) > 7 else None
-            data3_p = pins[8] if len(pins) > 8 else None
-            data3_n = pins[9] if len(pins) > 9 else None
+            clk_n = pins[0] if len(pins) > 0 else None
+            clk_p = pins[1] if len(pins) > 1 else None
+            data0_n = pins[2] if len(pins) > 2 else None
+            data0_p = pins[3] if len(pins) > 3 else None
+            data1_n = pins[4] if len(pins) > 4 else None
+            data1_p = pins[5] if len(pins) > 5 else None
+            data2_n = pins[6] if len(pins) > 6 else None
+            data2_p = pins[7] if len(pins) > 7 else None
+            data3_n = pins[8] if len(pins) > 8 else None
+            data3_p = pins[9] if len(pins) > 9 else None
 
             # Process each lane
             data_lanes_p = [data0_p, data1_p, data2_p, data3_p]
@@ -531,9 +546,9 @@ class Decoder(srd.Decoder):
                     self.update_lane_state(lane, lane_state, ss)
                     # print(f"DEBUG: Lane {lane} state: {lane_state}")
 
-                    # If in HS state, shift bits (process on all lanes to detect sync)
-                    if lane_state in [LANE_STATE_HS_0, LANE_STATE_HS_1]:
-                        bit_value = 1 if lane_state == LANE_STATE_HS_1 else 0
+                    # If in HS or THS-SETTLE state, shift bits (process on all lanes to detect sync)
+                    if lane_state in [LANE_STATE_HS, LANE_STATE_THS_SETTLE]:
+                        bit_value = 1 if data_p > data_n else 0
                         self.shift_bits(lane, bit_value, ss)
 
             # Use detected lane count if auto-detect is enabled
