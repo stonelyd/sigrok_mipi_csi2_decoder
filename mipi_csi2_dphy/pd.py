@@ -191,6 +191,9 @@ class Decoder(srd.Decoder):
         self.bit_counters = [0] * 4  # Bit counters for each lane
         self.sync_detected = [False] * 4  # Sync detection per lane
         self.byte_buffers = [[] for _ in range(4)]  # Byte buffers per lane
+        self.byte_synchronized = [False] * 4  # Track if byte boundaries are synchronized
+        self.packet_state = 'IDLE'  # Track packet parsing state
+        self.packet_buffer = []  # Buffer for current packet
 
         # Lane detection
         self.lane_detection_active = True
@@ -378,55 +381,126 @@ class Decoder(srd.Decoder):
         self.bit_shifters[lane] = (self.bit_shifters[lane] >> 1) | (bit_value << 7)
         self.bit_counters[lane] += 1
 
-        byte_value = self.bit_shifters[lane] & 0xFF
-        # print(f"DEBUG: Lane{lane}: Byte Value 0x{byte_value:02X}")
-        # Only annotate every 8th bit to reduce clutter
-        # if self.bit_counters[lane] % 8 == 0:
-        #     self.putg(ss - 7, ss + 1, 12, f'L{lane}: byte')
+        # Process complete bytes (every 8 bits)
+        if self.bit_counters[lane] >= 8:
+            byte_value = self.bit_shifters[lane] & 0xFF
+            self.bit_counters[lane] = 0  # Reset counter for next byte
+            
+            print(f"DEBUG: Lane{lane}: Byte 0x{byte_value:02X}")
+            
+            # Check for sync byte detection - look for 0xB8 or start processing after seeing non-zero data
+            if not self.sync_detected[lane]:
+                if byte_value == SYNC_MARKER:
+                    self.sync_detected[lane] = True
+                    self.lane_sync_detected[lane] = True
+                    self.byte_synchronized[lane] = True
+                    self.packet_state = 'SYNC_DETECTED'
+                    self.packet_buffer = []
+                    self.putg(ss - 7, ss + 1, 13, f'Lane{lane}: SYNC 0x{byte_value:02X}')
+                    self.putp(ss - 7, ss + 1, ['SYNC', None])
+                    print(f"DEBUG: Sync detected on lane {lane}: 0x{byte_value:02X}")
+                    return
+                elif byte_value != 0x00:
+                    # Start processing when we see first non-zero byte (assume sync already happened)
+                    print(f"DEBUG: Starting processing with first non-zero byte 0x{byte_value:02X} on lane {lane}")
+                    self.sync_detected[lane] = True
+                    self.lane_sync_detected[lane] = True 
+                    self.byte_synchronized[lane] = True
+                    self.packet_state = 'COLLECTING_PACKET'
+                    self.packet_buffer = [byte_value]
+                    return
+            
+            # Only process data bytes after sync is detected and byte boundaries are synchronized
+            if self.byte_synchronized[lane]:
+                self.process_packet_byte(lane, byte_value, ss)
 
-        # Check for sync byte when we have 8 bits
-        # if self.bit_counters[lane] >= 8:
-        byte_value = self.bit_shifters[lane] & 0xFF
-            # self.bit_shifters[lane] = 0
-            # self.bit_counters[lane] = 0
-
-            # Debug sync detection if needed
-            # if byte_value == SYNC_MARKER:
-        print(f"-------------------------------------------------------------DEBUG: Lane{lane}: Byte Value 0x{byte_value:02X}")
-        # Check for sync byte (try both 0xAB and 0x55)
-        if (byte_value == SYNC_MARKER ) and not self.sync_detected[lane]:
-            self.sync_detected[lane] = True
-            self.lane_sync_detected[lane] = True  # Mark lane as having sync
-            self.putg(ss - 7, ss + 1, 13, f'Lane{lane}: SYNC 0x{byte_value:02X}')
-            self.putp(ss - 7, ss + 1, ['SYNC', None])
-            print(f"-----------------------------------DEBUG: Sync byte detected on lane {lane}: 0x{byte_value:02X}")
-
-            # Add to byte buffer
-            self.byte_buffers[lane].append(byte_value)
-
-            # Process complete bytes
-            self.process_lane_bytes(lane, ss)
-
-    def process_lane_bytes(self, lane, ss):
-        """Process complete bytes from a lane"""
-        if not self.byte_buffers[lane]:
-            return
-
-        # Process all available bytes
-        while self.byte_buffers[lane]:
-            byte_val = self.byte_buffers[lane].pop(0)
-
-            # Check for markers
-            if byte_val == SOT_MARKER:
-                self.decode_sot(ss - 8, ss + 1)
-            elif byte_val == EOT_MARKER:
-                self.decode_eot(ss - 8, ss + 1)
-            elif byte_val == SYNC_MARKER:
-                # Already handled in shift_bits
-                pass
+    def process_packet_byte(self, lane, byte_value, ss):
+        """Process a complete byte in packet context"""
+        print(f"DEBUG: Processing packet byte 0x{byte_value:02X} on lane {lane}, state: {self.packet_state}")
+        
+        # Handle different states
+        if self.packet_state == 'SYNC_DETECTED':
+            # After sync, next byte should be SOT (0xB8) or we start collecting packet data
+            if byte_value == SOT_MARKER:  # 0xB8 - Start of Transmission
+                self.packet_state = 'SOT_DETECTED'
+                self.packet_buffer = []
+                self.putg(ss - 7, ss + 1, 0, 'SOT')
+                self.putp(ss - 7, ss + 1, ['SOT', None])
+                print(f"DEBUG: SOT detected")
             else:
-                # Regular data byte
-                self.packet_data.append(byte_val)
+                # Might be packet data directly after sync - add to buffer
+                self.packet_state = 'COLLECTING_PACKET'
+                self.packet_buffer = [byte_value]
+                print(f"DEBUG: Started collecting packet data with byte 0x{byte_value:02X}")
+                
+        elif self.packet_state == 'SOT_DETECTED' or self.packet_state == 'COLLECTING_PACKET':
+            if byte_value == EOT_MARKER:  # 0x9C - End of Transmission  
+                self.packet_state = 'IDLE'
+                self.process_complete_packet(ss)
+                self.putg(ss - 7, ss + 1, 1, 'EOT')
+                self.putp(ss - 7, ss + 1, ['EOT', None])
+                print(f"DEBUG: EOT detected, packet complete")
+            else:
+                # Add byte to packet buffer
+                self.packet_buffer.append(byte_value)
+                print(f"DEBUG: Added byte 0x{byte_value:02X} to packet buffer (length: {len(self.packet_buffer)})")
+                
+                # Check if we have enough bytes for a packet header (4 bytes minimum)
+                if len(self.packet_buffer) >= 4:
+                    self.analyze_packet_header(ss)
+    
+    def analyze_packet_header(self, ss):
+        """Analyze packet header to determine packet type and length"""
+        if len(self.packet_buffer) < 4:
+            return
+            
+        # First 4 bytes form the packet header  
+        header = self.packet_buffer[:4]
+        data_id = header[0]
+        vc_dt = header[1] 
+        virtual_channel = (vc_dt >> 6) & 0x03  # Upper 2 bits
+        data_type = vc_dt & 0x3F  # Lower 6 bits
+        data_field = (header[3] << 8) | header[2]  # 16-bit data field for short packets
+        
+        print(f"DEBUG: Header analysis - DataID: 0x{data_id:02X}, VC: {virtual_channel}, DT: 0x{data_type:02X}, Data: 0x{data_field:04X}")
+        
+        # Determine packet type based on data type value
+        # Data types 0x00-0x07 and 0x08-0x0F are typically short packets
+        # Data types 0x10+ are typically long packets (image data)
+        if data_type <= 0x0F or data_field == 0:
+            # Short packet - header contains all data, process immediately
+            print(f"DEBUG: Short packet detected - DT: 0x{data_type:02X}")
+            self.decode_short_packet_new(ss, header)
+            self.packet_buffer = []  # Reset for next packet
+            self.packet_state = 'SYNC_DETECTED'  # Ready for next packet
+        else:
+            # Long packet - the data field is actually word count for long packets
+            word_count = data_field
+            print(f"DEBUG: Long packet detected, expecting {word_count} payload bytes + 2 checksum bytes")
+            # Continue collecting bytes...
+    
+    def process_complete_packet(self, ss):
+        """Process a complete packet when EOT is received"""
+        if len(self.packet_buffer) >= 4:
+            header = self.packet_buffer[:4]
+            vc_dt = header[1]
+            data_type = vc_dt & 0x3F
+            word_count = (header[3] << 8) | header[2]
+            
+            if word_count == 0:
+                # Short packet
+                self.decode_short_packet_new(ss, header)
+            else:
+                # Long packet with payload
+                if len(self.packet_buffer) >= 4 + word_count + 2:
+                    payload = self.packet_buffer[4:4+word_count]
+                    checksum = self.packet_buffer[4+word_count:4+word_count+2]
+                    self.decode_long_packet_new(ss, header, payload, checksum)
+                else:
+                    print(f"DEBUG: Incomplete long packet - expected {4+word_count+2} bytes, got {len(self.packet_buffer)}")
+                
+        self.packet_buffer = []
+        self.packet_state = 'SYNC_DETECTED'  # Ready for next packet
 
     def decode_sot(self, ss, es):
         """Decode Start of Transmission marker"""
@@ -468,6 +542,74 @@ class Decoder(srd.Decoder):
 
         # Binary output
         self.putb(ss, es, data)
+        
+    def decode_short_packet_new(self, ss, header):
+        """Decode short packet with proper CSI-2 format"""
+        if len(header) < 4:
+            self.putg(ss, ss + 32, 7, f'Short packet too short: {len(header)} bytes')
+            return
+            
+        data_id = header[0]
+        vc_dt = header[1] 
+        virtual_channel = (vc_dt >> 6) & 0x03  # Upper 2 bits
+        data_type = vc_dt & 0x3F  # Lower 6 bits
+        data_field = (header[3] << 8) | header[2]  # 16-bit data field (little endian)
+        
+        # Decode short packet types based on CSI-2 specification
+        packet_info = self.decode_short_packet_type(data_type, data_field)
+        
+        dt_name = DATA_TYPE_NAMES.get(data_type, f'0x{data_type:02X}')
+        
+        self.putp(ss, ss + 32, ['SHORT_PACKET', [data_type, virtual_channel, data_field]])
+        self.putg(ss, ss + 32, 3, f'Short: {packet_info} VC{virtual_channel}')
+        self.putg(ss, ss + 32, 8, f'DT: {dt_name}')
+        self.putg(ss, ss + 32, 9, f'VC: {virtual_channel}')
+        
+        print(f"DEBUG: Short packet decoded - DT: 0x{data_type:02X} ({packet_info}), VC: {virtual_channel}, Data: 0x{data_field:04X}")
+        
+        # Binary output
+        self.putb(ss, ss + 32, header)
+        
+    def decode_short_packet_type(self, data_type, data_field):
+        """Decode specific short packet types according to CSI-2 spec"""
+        # Short packet data types (from CSI-2 spec)
+        short_packet_types = {
+            0x00: f"Frame Start (Frame: {data_field})",
+            0x01: f"Frame End (Frame: {data_field})", 
+            0x02: f"Line Start (Line: {data_field})",
+            0x03: f"Line End (Line: {data_field})",
+            0x08: f"Generic Short 1 (Data: 0x{data_field:04X})",
+            0x09: f"Generic Short 2 (Data: 0x{data_field:04X})",
+            0x0A: f"Generic Short 3 (Data: 0x{data_field:04X})",
+            0x0B: f"Generic Short 4 (Data: 0x{data_field:04X})",
+            0x0C: f"Generic Short 5 (Data: 0x{data_field:04X})",
+            0x0D: f"Generic Short 6 (Data: 0x{data_field:04X})",
+            0x0E: f"Generic Short 7 (Data: 0x{data_field:04X})",
+            0x0F: f"Generic Short 8 (Data: 0x{data_field:04X})",
+        }
+        
+        return short_packet_types.get(data_type, f"Unknown Short (0x{data_type:02X}, Data: 0x{data_field:04X})")
+        
+    def decode_long_packet_new(self, ss, header, payload, checksum):
+        """Decode long packet with payload and checksum"""
+        data_id = header[0]
+        vc_dt = header[1]
+        virtual_channel = (vc_dt >> 6) & 0x03
+        data_type = vc_dt & 0x3F
+        word_count = (header[3] << 8) | header[2]
+        
+        dt_name = DATA_TYPE_NAMES.get(data_type, f'0x{data_type:02X}')
+        
+        self.putp(ss, ss + 32 + len(payload) + 16, ['LONG_PACKET', [data_type, virtual_channel, word_count, payload]])
+        self.putg(ss, ss + 32, 4, f'Long: {dt_name} VC{virtual_channel} WC:{word_count}')
+        self.putg(ss, ss + 32, 8, f'DT: {dt_name}')
+        self.putg(ss, ss + 32, 9, f'VC: {virtual_channel}')
+        
+        if payload:
+            self.putg(ss + 32, ss + 32 + len(payload) * 8, 5, f'Payload: {len(payload)} bytes')
+            self.putb(ss + 32, ss + 32 + len(payload) * 8, payload)
+            
+        print(f"DEBUG: Long packet decoded - DT: 0x{data_type:02X} ({dt_name}), VC: {virtual_channel}, WC: {word_count}, Payload: {len(payload)} bytes")
 
     def decode_long_packet(self, ss, es, data):
         """Decode long packet header"""
