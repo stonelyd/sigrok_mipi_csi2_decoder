@@ -209,6 +209,7 @@ class Decoder(srd.Decoder):
     def metadata(self, key, value):
         if key == srd.SRD_CONF_SAMPLERATE:
             self.samplerate = value
+            print(f"DEBUG: Received samplerate = {value} Hz from sigrok")
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -495,8 +496,14 @@ class Decoder(srd.Decoder):
         while True:
             # Wait for any signal change, not just clock edges
             pins = self.wait({0: 'e'})  # Wait for clock edge
-            ss = self.samplenum // 280
-            print(f"DEBUG: Sample {ss}, Pins: {pins}")
+            ss = self.samplenum  # Test without scaling
+            print(f"DEBUG: RAW samplenum={self.samplenum}, SCALED sample={ss}, Pins: {pins}")
+            
+            # Test: put annotations at both positions to see which aligns
+            if self.samplenum == 10000:  # First VCD timestamp
+                self.putg(self.samplenum, self.samplenum + 100, 7, f'RAW@{self.samplenum}')
+                self.putg(ss, ss + 10, 7, f'SCALED@{ss}')
+                print(f"DEBUG: Put RAW annotation at {self.samplenum}, SCALED at {ss}")
 
 
             # Extract differential channels (clk_p, clk_n, data0_p, data0_n, ...)

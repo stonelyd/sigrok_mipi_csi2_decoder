@@ -13,14 +13,13 @@ This is a sigrok protocol decoder for MIPI CSI-2 D-PHY, implementing high-speed 
 # Test with sigrok-cli using VCD files (requires SIGROKDECODE_DIR environment variable)
 timeout 10s bash -c 'export SIGROKDECODE_DIR=/home/stonelyd/sigrok_mipi_decoder && sigrok-cli --input-file test_csi2_basic.vcd --channels clk_p,data0_p,data1_p,data2_p,data3_p -P mipi_csi2_dphy --loglevel 5'
 
-# Mock testing (for structure verification)
-python3 testing/test_decoder_mock.py
 ```
+## Mipi csi-2 specifications.
 
-### Installation
-```bash
-# Install to sigrok decoders directory
-cp -r mipi_csi2_dphy /path/to/libsigrokdecode/decoders/
+```
+attached_assets/
+├──441578464-mipi-D-PHY-specification-v2-5-pdf.pdf      # D-phy Specs
+├──703695522-Mipi-CSI-2-Specification-v4-0-1.pdf        # CSI-2 Specs
 ```
 
 ## Architecture
@@ -40,7 +39,7 @@ cp -r mipi_csi2_dphy /path/to/libsigrokdecode/decoders/
 - **Virtual Channel Support**: Multi-channel parsing with metadata extraction
 
 ### Channel Configuration
-- **Required**: CLK_P (clock lane), DATA0_P (data lane 0)  
+- **Required**: CLK_P (clock lane), DATA0_P (data lane 0)
 - **Optional**: DATA1_P, DATA2_P, DATA3_P (additional data lanes)
 - **Options**: Number of lanes (0=auto-detect), expected bitrate (500-2500 Mbps)
 
