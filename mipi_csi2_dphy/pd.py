@@ -59,6 +59,7 @@ LANE_STATE_LP_10 = 'LP-10'  # Low Power Turn-around
 LANE_STATE_THS_SETTLE = 'THS-SETTLE'  # High Speed Settle (custom state)
 LANE_STATE_HS = 'HS'        # High Speed Data
 LANE_STATE_HS_SYNC = 'HS-SYNC'  # High Speed Sync
+LANE_STATE_HS_TRAIL = 'HS-TRAIL'  # High Speed Trail (packet end)
 
 # CSI-2 Data Types (most common ones)
 CSI2_DT_YUV420_8BIT = 0x18
@@ -194,6 +195,8 @@ class Decoder(srd.Decoder):
         self.byte_synchronized = [False] * 4  # Track if byte boundaries are synchronized
         self.packet_state = 'IDLE'  # Track packet parsing state
         self.packet_buffer = []  # Buffer for current packet
+        self.expected_packet_length = 0  # Expected total packet length
+        self.packet_end_detected = [False] * 4  # Track if packet end detected per lane
 
         # Lane detection
         self.lane_detection_active = True
@@ -303,16 +306,30 @@ class Decoder(srd.Decoder):
                 # Stay in THS-SETTLE regardless of physical state
                 return LANE_STATE_THS_SETTLE
 
-        # 5. If in HS mode, only exit when returning to LP-11
+        # 5. Transition from HS to HS-TRAIL when packet end is detected
         if prev_state == LANE_STATE_HS:
-            if physical_state == LANE_STATE_LP_11:
-                # Already handled above
+            if self.packet_end_detected[lane]:
+                # Transition to HS-TRAIL state after packet end
+                self.packet_end_detected[lane] = False  # Reset flag
+                self.lane_prev_state[lane] = LANE_STATE_HS_TRAIL
+                return LANE_STATE_HS_TRAIL
+            elif physical_state == LANE_STATE_LP_11:
+                # Direct transition from HS to LP-11 (if no packet end detected)
                 pass
             else:
                 # Stay in HS mode
                 return LANE_STATE_HS
+        
+        # 6. Transition from HS-TRAIL to LP-11
+        if prev_state == LANE_STATE_HS_TRAIL:
+            if physical_state == LANE_STATE_LP_11:
+                self.lane_prev_state[lane] = LANE_STATE_LP_11
+                return LANE_STATE_LP_11
+            else:
+                # Stay in HS-TRAIL until LP-11 is reached
+                return LANE_STATE_HS_TRAIL
 
-        # 6. Default: follow physical state for normal LP states
+        # 7. Default: follow physical state for normal LP states
         self.lane_prev_state[lane] = physical_state
         return physical_state
 
@@ -334,9 +351,13 @@ class Decoder(srd.Decoder):
             self.lane_state_start[lane] = ss
             self.putp(ss, ss, ['LANE_STATE', [lane, new_state]])
 
-            # Add transition marker for HS start
+            # Add transition markers for key state changes
             if new_state == LANE_STATE_HS and old_state == LANE_STATE_LP_11:
                 self.putg(ss, ss + 10, 2, f'L{lane} HS Start')
+            elif new_state == LANE_STATE_HS_TRAIL and old_state == LANE_STATE_HS:
+                self.putg(ss, ss + 10, 2, f'L{lane} Packet End')
+            elif new_state == LANE_STATE_LP_11 and old_state == LANE_STATE_HS_TRAIL:
+                self.putg(ss, ss + 10, 2, f'L{lane} HS End')
 
             # Track transitions to HS state for lane detection
             if new_state in [LANE_STATE_HS, LANE_STATE_HS_SYNC]:
@@ -448,6 +469,10 @@ class Decoder(srd.Decoder):
                 # Check if we have enough bytes for a packet header (4 bytes minimum)
                 if len(self.packet_buffer) >= 4:
                     self.analyze_packet_header(ss)
+                
+                # For long packets, check if we've received the complete packet
+                if self.expected_packet_length > 4:  # Long packet
+                    self.check_packet_end(ss)
     
     def analyze_packet_header(self, ss):
         """Analyze packet header to determine packet type and length"""
@@ -468,16 +493,31 @@ class Decoder(srd.Decoder):
         # Data types 0x00-0x07 and 0x08-0x0F are typically short packets
         # Data types 0x10+ are typically long packets (image data)
         if data_type <= 0x0F or data_field == 0:
-            # Short packet - header contains all data, process immediately
+            # Short packet - always exactly 4 bytes total
             print(f"DEBUG: Short packet detected - DT: 0x{data_type:02X}")
+            self.expected_packet_length = 4  # Short packets are always 4 bytes
             self.decode_short_packet_new(ss, header)
-            self.packet_buffer = []  # Reset for next packet
-            self.packet_state = 'SYNC_DETECTED'  # Ready for next packet
+            self.check_packet_end(ss)
         else:
             # Long packet - the data field is actually word count for long packets
             word_count = data_field
-            print(f"DEBUG: Long packet detected, expecting {word_count} payload bytes + 2 checksum bytes")
+            self.expected_packet_length = 4 + word_count + 2  # header + payload + checksum
+            print(f"DEBUG: Long packet detected, expecting {word_count} payload bytes + 2 checksum bytes (total: {self.expected_packet_length})")
             # Continue collecting bytes...
+            
+    def check_packet_end(self, ss):
+        """Check if we've received the complete packet and trigger state transition"""
+        if len(self.packet_buffer) >= self.expected_packet_length:
+            print(f"DEBUG: Packet end detected - received {len(self.packet_buffer)} bytes, expected {self.expected_packet_length}")
+            # Mark packet end detected for triggering HS-TRAIL state
+            for lane in range(4):
+                if self.byte_synchronized[lane]:
+                    self.packet_end_detected[lane] = True
+            
+            # Reset for next packet
+            self.packet_buffer = []
+            self.packet_state = 'PACKET_COMPLETE'
+            self.expected_packet_length = 0
     
     def process_complete_packet(self, ss):
         """Process a complete packet when EOT is received"""
