@@ -47,9 +47,8 @@ Packet:
 '''
 
 # Protocol constants
-SOT_MARKER = 0xB8
+SYNC_MARKER = 0xB8  # Start of Transmission / Sync byte
 EOT_MARKER = 0x9C
-SYNC_MARKER = 0xB8
 
 # D-PHY Lane States
 LANE_STATE_LP_11 = 'LP-11'  # Low Power Stop state
@@ -423,7 +422,7 @@ class Decoder(srd.Decoder):
                 self.lane_sync_detected[lane] = True
                 self.byte_synchronized[lane] = True
                 self.bit_counters[lane] = 0  # Reset bit counter after sync
-                self.packet_state = 'SYNC_DETECTED'
+                self.packet_state = 'COLLECTING_PACKET'
                 self.packet_buffer = []
                 self.putg(ss - 7, ss + 1, 13, f'Lane{lane}: SYNC 0x{byte_value:02X}')
                 self.putp(ss - 7, ss + 1, ['SYNC', None])
@@ -436,22 +435,8 @@ class Decoder(srd.Decoder):
         """Process a complete byte in packet context"""
         print(f"DEBUG: Processing packet byte 0x{byte_value:02X} on lane {lane}, state: {self.packet_state}")
 
-        # Handle different states
-        if self.packet_state == 'SYNC_DETECTED':
-            # After sync, next byte should be SOT (0xB8) or we start collecting packet data
-            if byte_value == SOT_MARKER:  # 0xB8 - Start of Transmission
-                self.packet_state = 'SOT_DETECTED'
-                self.packet_buffer = []
-                self.putg(ss - 7, ss + 1, 0, 'SOT')
-                self.putp(ss - 7, ss + 1, ['SOT', None])
-                print(f"DEBUG: SOT detected")
-            else:
-                # Might be packet data directly after sync - add to buffer
-                self.packet_state = 'COLLECTING_PACKET'
-                self.packet_buffer = [byte_value]
-                print(f"DEBUG: Started collecting packet data with byte 0x{byte_value:02X}")
-
-        elif self.packet_state == 'SOT_DETECTED' or self.packet_state == 'COLLECTING_PACKET':
+        # After sync detection, we expect packet data (DataID is first byte)
+        if self.packet_state == 'COLLECTING_PACKET':
             if byte_value == EOT_MARKER:  # 0x9C - End of Transmission
                 self.packet_state = 'IDLE'
                 self.process_complete_packet(ss)
