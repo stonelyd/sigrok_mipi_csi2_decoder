@@ -48,7 +48,6 @@ Packet:
 
 # Protocol constants
 SYNC_MARKER = 0xB8  # Start of Transmission / Sync byte
-EOT_MARKER = 0x9C
 
 # D-PHY Lane States
 LANE_STATE_LP_11 = 'LP-11'  # Low Power Stop state
@@ -140,8 +139,8 @@ class Decoder(srd.Decoder):
         ('sot', 'Start of Transmission'),
         ('eot', 'End of Transmission'),
         ('sync', 'Lane synchronization'),
-        ('short-packet', 'Short packet'),
-        ('long-packet', 'Long packet'),
+        ('packet-header', 'Packet header'),
+        ('na-placeholder', 'Placeholder'),
         ('payload', 'Packet payload'),
         ('footer', 'Packet footer'),
         ('error', 'Protocol error'),
@@ -429,37 +428,40 @@ class Decoder(srd.Decoder):
                 print(f"DEBUG: Sync detected on lane {lane}: 0x{byte_value:02X}")
                 return
 
-
-
     def process_packet_byte(self, lane, byte_value, ss):
         """Process a complete byte in packet context"""
         print(f"DEBUG: Processing packet byte 0x{byte_value:02X} on lane {lane}, state: {self.packet_state}")
 
         # After sync detection, we expect packet data (DataID is first byte)
         if self.packet_state == 'COLLECTING_PACKET':
-            if byte_value == EOT_MARKER:  # 0x9C - End of Transmission
-                self.packet_state = 'IDLE'
+            # Add byte to packet buffer
+            self.packet_buffer.append(byte_value)
+            print(f"DEBUG: Added byte 0x{byte_value:02X} to packet buffer (length: {len(self.packet_buffer)})")
+
+            # Check if we have enough bytes for a packet header (4 bytes minimum)
+            if len(self.packet_buffer) == 4:
+                word_count = self.analyze_packet_header(ss)
+                self.expected_packet_length = word_count
+
+            # Check if we've received the complete packet based on expected length
+            if self.expected_packet_length > 0 and len(self.packet_buffer) >= self.expected_packet_length:
+                print(f"DEBUG: Packet complete - received {len(self.packet_buffer)} bytes, expected {self.expected_packet_length}")
                 self.process_complete_packet(ss)
-                self.putg(ss - 7, ss + 1, 1, 'EOT')
-                self.putp(ss - 7, ss + 1, ['EOT', None])
-                print(f"DEBUG: EOT detected, packet complete")
-            else:
-                # Add byte to packet buffer
-                self.packet_buffer.append(byte_value)
-                print(f"DEBUG: Added byte 0x{byte_value:02X} to packet buffer (length: {len(self.packet_buffer)})")
-
-                # Check if we have enough bytes for a packet header (4 bytes minimum)
-                if len(self.packet_buffer) >= 4:
-                    self.analyze_packet_header(ss)
-
-                # For long packets, check if we've received the complete packet
-                if self.expected_packet_length > 4:  # Long packet
-                    self.check_packet_end(ss)
+                self.packet_state = 'IDLE'
+                self.putg(ss - 7, ss + 1, 1, 'Packet Complete')
+                self.putp(ss - 7, ss + 1, ['PACKET_COMPLETE', None])
+                # Mark packet end detected for triggering HS-TRAIL state
+                for l in range(4):
+                    if self.byte_synchronized[l]:
+                        self.packet_end_detected[l] = True
+                # Reset for next packet
+                self.packet_buffer = []
+                self.expected_packet_length = 0
 
     def analyze_packet_header(self, ss):
         """Analyze packet header to determine packet type and length"""
         if len(self.packet_buffer) < 4:
-            return
+            return 0
 
         # First 4 bytes form the packet header
         header = self.packet_buffer[:4]
@@ -477,29 +479,15 @@ class Decoder(srd.Decoder):
         if data_type <= 0x0F or data_field == 0:
             # Short packet - always exactly 4 bytes total
             print(f"DEBUG: Short packet detected - DT: 0x{data_type:02X}")
-            self.expected_packet_length = 4  # Short packets are always 4 bytes
+            word_count = 4  # Short packets are always 4 bytes
             self.decode_short_packet_new(ss, header)
-            self.check_packet_end(ss)
+            return word_count
         else:
             # Long packet - the data field is actually word count for long packets
-            word_count = data_field
-            self.expected_packet_length = 4 + word_count + 2  # header + payload + checksum
-            print(f"DEBUG: Long packet detected, expecting {word_count} payload bytes + 2 checksum bytes (total: {self.expected_packet_length})")
-            # Continue collecting bytes...
+            word_count = 4 + data_field + 2  # header + payload + checksum
+            print(f"DEBUG: Long packet detected, expecting {data_field} payload bytes + 2 checksum bytes (total: {word_count})")
+            return word_count
 
-    def check_packet_end(self, ss):
-        """Check if we've received the complete packet and trigger state transition"""
-        if len(self.packet_buffer) >= self.expected_packet_length:
-            print(f"DEBUG: Packet end detected - received {len(self.packet_buffer)} bytes, expected {self.expected_packet_length}")
-            # Mark packet end detected for triggering HS-TRAIL state
-            for lane in range(4):
-                if self.byte_synchronized[lane]:
-                    self.packet_end_detected[lane] = True
-
-            # Reset for next packet
-            self.packet_buffer = []
-            self.packet_state = 'PACKET_COMPLETE'
-            self.expected_packet_length = 0
 
     def process_complete_packet(self, ss):
         """Process a complete packet when EOT is received"""
