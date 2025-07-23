@@ -47,18 +47,17 @@ Packet:
 '''
 
 # Protocol constants
-SOT_MARKER = 0xB8
-EOT_MARKER = 0x9C
-SYNC_MARKER = 0xB8
+SYNC_MARKER = 0xB8  # Start of Transmission / Sync byte
 
 # D-PHY Lane States
 LANE_STATE_LP_11 = 'LP-11'  # Low Power Stop state
 LANE_STATE_LP_01 = 'LP-01'  # Low Power Turn-around
 LANE_STATE_LP_00 = 'LP-00'  # Low Power Turn-around
 LANE_STATE_LP_10 = 'LP-10'  # Low Power Turn-around
-LANE_STATE_HS_0 = 'HS-0'    # High Speed Data 0
-LANE_STATE_HS_1 = 'HS-1'    # High Speed Data 1
+LANE_STATE_THS_SETTLE = 'THS-SETTLE'  # High Speed Settle (custom state)
+LANE_STATE_HS = 'HS'        # High Speed Data
 LANE_STATE_HS_SYNC = 'HS-SYNC'  # High Speed Sync
+LANE_STATE_HS_TRAIL = 'HS-TRAIL'  # High Speed Trail (packet end)
 
 # CSI-2 Data Types (most common ones)
 CSI2_DT_YUV420_8BIT = 0x18
@@ -111,14 +110,19 @@ class Decoder(srd.Decoder):
 
     # Channel definitions
     channels = (
+        {'id': 'clk_n', 'name': 'CLK_N', 'desc': 'Clock lane negative'},
         {'id': 'clk_p', 'name': 'CLK_P', 'desc': 'Clock lane positive'},
+        {'id': 'data0_n', 'name': 'DATA0_N', 'desc': 'Data lane 0 negative'},
         {'id': 'data0_p', 'name': 'DATA0_P', 'desc': 'Data lane 0 positive'},
     )
 
     # Optional channels (can be None)
     optional_channels = (
+        {'id': 'data1_n', 'name': 'DATA1_N', 'desc': 'Data lane 1 negative (optional)'},
         {'id': 'data1_p', 'name': 'DATA1_P', 'desc': 'Data lane 1 positive (optional)'},
+        {'id': 'data2_n', 'name': 'DATA2_N', 'desc': 'Data lane 2 negative (optional)'},
         {'id': 'data2_p', 'name': 'DATA2_P', 'desc': 'Data lane 2 positive (optional)'},
+        {'id': 'data3_n', 'name': 'DATA3_N', 'desc': 'Data lane 3 negative (optional)'},
         {'id': 'data3_p', 'name': 'DATA3_P', 'desc': 'Data lane 3 positive (optional)'},
     )
 
@@ -135,8 +139,8 @@ class Decoder(srd.Decoder):
         ('sot', 'Start of Transmission'),
         ('eot', 'End of Transmission'),
         ('sync', 'Lane synchronization'),
-        ('short-packet', 'Short packet'),
-        ('long-packet', 'Long packet'),
+        ('packet-header', 'Packet header'),
+        ('na-placeholder', 'Placeholder'),
         ('payload', 'Packet payload'),
         ('footer', 'Packet footer'),
         ('error', 'Protocol error'),
@@ -186,6 +190,11 @@ class Decoder(srd.Decoder):
         self.bit_counters = [0] * 4  # Bit counters for each lane
         self.sync_detected = [False] * 4  # Sync detection per lane
         self.byte_buffers = [[] for _ in range(4)]  # Byte buffers per lane
+        self.byte_synchronized = [False] * 4  # Track if byte boundaries are synchronized
+        self.packet_state = 'IDLE'  # Track packet parsing state
+        self.packet_buffer = []  # Buffer for current packet
+        self.expected_packet_length = 0  # Expected total packet length
+        self.packet_end_detected = [False] * 4  # Track if packet end detected per lane
 
         # Lane detection
         self.lane_detection_active = True
@@ -203,6 +212,7 @@ class Decoder(srd.Decoder):
     def metadata(self, key, value):
         if key == srd.SRD_CONF_SAMPLERATE:
             self.samplerate = value
+            pass  # print(f"DEBUG: Received samplerate = {value} Hz from sigrok")
 
     def start(self):
         self.out_python = self.register(srd.OUTPUT_PYTHON)
@@ -218,16 +228,7 @@ class Decoder(srd.Decoder):
             self.num_lanes = 0  # Auto-detect
             self.expected_bitrate = 1000
 
-        # Add a test annotation to verify decoder is working
-        self.putg(0, 1000, 0, 'MIPI CSI-2 D-PHY Decoder Started')
-
-        # Add a more prominent test annotation for lane states
-        self.putg(10000, 12000, 10, 'LANE STATE TEST - Should be visible')
-
-        # Add very prominent test annotations that should definitely be visible
-        self.putg(5000, 15000, 10, 'VERY LONG LANE STATE TEST')
-        self.putg(5000, 15000, 11, 'VERY LONG LANE COUNT TEST')
-        self.putg(5000, 15000, 12, 'VERY LONG BIT SHIFT TEST')
+            self.putg(0, 1000, 0, 'MIPI CSI-2 D-PHY Decoder Started')
 
     def putg(self, ss, es, cls, text):
         self.put(ss, es, self.out_ann, [cls, [text]])
@@ -238,36 +239,97 @@ class Decoder(srd.Decoder):
     def putb(self, ss, es, data):
         self.put(ss, es, self.out_binary, data)
 
-    def detect_lane_state(self, lane, data_p, data_n=None):
-        """Detect the state of a lane based on signals"""
+    def detect_lane_state(self, lane, data_p, data_n):
+        """Detect D-PHY lane state with THS-SETTLE and simplified HS detection"""
         if data_p is None:
             return None
 
-        # For MIPI CSI-2 with single-ended signals, we need to be more careful
-        # Static signals (high or low) should be treated as LP state
-        # Only consider HS state when we see actual transitions
+        # Handle missing data_n (single-ended fallback)
+        if data_n is None:
+            data_n = 0  # Assume data_n=0 for single-ended signals
 
-        # Store the previous signal value for this lane
-        if not hasattr(self, 'lane_prev_signal'):
-            self.lane_prev_signal = [None] * 4
+        # Initialize tracking state
+        if not hasattr(self, 'lane_prev_state'):
+            self.lane_prev_state = [LANE_STATE_LP_11] * 4
+            self.lane_in_ths_settle = [False] * 4
+            self.lane_sync_detected = [False] * 4
+            self.lane_was_lp00 = [False] * 4
 
-        # If this is the first sample for this lane, assume LP state
-        if self.lane_prev_signal[lane] is None:
-            self.lane_prev_signal[lane] = data_p
-            return LANE_STATE_LP_11
+        prev_state = self.lane_prev_state[lane]
 
-        # Check if the signal has changed (indicating HS activity)
-        if self.lane_prev_signal[lane] != data_p:
-            # Signal changed - this indicates HS activity
-            self.lane_prev_signal[lane] = data_p
-            if data_p == 1:
-                return LANE_STATE_HS_1
-            else:
-                return LANE_STATE_HS_0
+        # Determine current physical state based on differential pair
+        if data_p == 1 and data_n == 1:
+            physical_state = LANE_STATE_LP_11  # Stop state
+        elif data_p == 0 and data_n == 1:
+            physical_state = LANE_STATE_LP_01  # Turnaround
+        elif data_p == 0 and data_n == 0:
+            physical_state = LANE_STATE_LP_00  # Turnaround
+        elif data_p == 1 and data_n == 0:
+            physical_state = LANE_STATE_LP_10  # Turnaround
         else:
-            # Signal hasn't changed - this is likely LP state
-            self.lane_prev_signal[lane] = data_p
+            # Invalid state - should not happen with proper differential signals
+            physical_state = LANE_STATE_LP_11
+
+        # State machine logic with THS-SETTLE
+
+        # 1. Return to LP-11 from any state
+        if physical_state == LANE_STATE_LP_11:
+            self.lane_in_ths_settle[lane] = False
+            self.lane_sync_detected[lane] = False
+            self.lane_prev_state[lane] = LANE_STATE_LP_11
             return LANE_STATE_LP_11
+
+        # 2. Track LP-00 state for THS-SETTLE detection
+        if physical_state == LANE_STATE_LP_00:
+            self.lane_was_lp00[lane] = True
+        elif physical_state == LANE_STATE_LP_11:
+            self.lane_was_lp00[lane] = False
+
+        # 3. Transition to THS-SETTLE when leaving LP-00 after the sequence
+        if (prev_state == LANE_STATE_LP_00 and physical_state != LANE_STATE_LP_00 and
+            self.lane_was_lp00[lane]):
+            self.lane_in_ths_settle[lane] = True
+            self.lane_was_lp00[lane] = False  # Reset flag
+            self.lane_prev_state[lane] = LANE_STATE_THS_SETTLE
+            return LANE_STATE_THS_SETTLE
+
+        # 4. Stay in THS-SETTLE until sync detected
+        if self.lane_in_ths_settle[lane]:
+            # Check if sync has been detected (will be set by sync detection logic)
+            if self.lane_sync_detected[lane]:
+                self.lane_in_ths_settle[lane] = False
+                self.lane_prev_state[lane] = LANE_STATE_HS
+                return LANE_STATE_HS
+            else:
+                # Stay in THS-SETTLE regardless of physical state
+                return LANE_STATE_THS_SETTLE
+
+        # 5. Transition from HS to HS-TRAIL when packet end is detected
+        if prev_state == LANE_STATE_HS:
+            if self.packet_end_detected[lane]:
+                # Transition to HS-TRAIL state after packet end
+                self.packet_end_detected[lane] = False  # Reset flag
+                self.lane_prev_state[lane] = LANE_STATE_HS_TRAIL
+                return LANE_STATE_HS_TRAIL
+            elif physical_state == LANE_STATE_LP_11:
+                # Direct transition from HS to LP-11 (if no packet end detected)
+                pass
+            else:
+                # Stay in HS mode
+                return LANE_STATE_HS
+
+        # 6. Transition from HS-TRAIL to LP-11
+        if prev_state == LANE_STATE_HS_TRAIL:
+            if physical_state == LANE_STATE_LP_11:
+                self.lane_prev_state[lane] = LANE_STATE_LP_11
+                return LANE_STATE_LP_11
+            else:
+                # Stay in HS-TRAIL until LP-11 is reached
+                return LANE_STATE_HS_TRAIL
+
+        # 7. Default: follow physical state for normal LP states
+        self.lane_prev_state[lane] = physical_state
+        return physical_state
 
     def update_lane_state(self, lane, new_state, ss):
         """Update lane state and annotate if changed"""
@@ -276,19 +338,27 @@ class Decoder(srd.Decoder):
 
         if self.lane_states[lane] != new_state:
             old_state = self.lane_states[lane]
+            old_start = self.lane_state_start[lane]
+
+            # Annotate the previous state duration
+            if old_start is not None:
+                self.putg(old_start, ss, 10, f'L{lane}: {old_state}')
+
+            # Update state tracking
             self.lane_states[lane] = new_state
             self.lane_state_start[lane] = ss
+            self.putp(ss, ss, ['LANE_STATE', [lane, new_state]])
 
-                                                # Annotate state change - make it more visible with longer duration
-            self.putg(self.lane_state_start[lane], ss + 1000, 10, f'Lane{lane}: {old_state}→{new_state}')
-            self.putp(self.lane_state_start[lane], ss, ['LANE_STATE', [lane, new_state]])
-
-            # Also add a more visible annotation for significant state changes
-            if new_state in [LANE_STATE_HS_0, LANE_STATE_HS_1]:
-                self.putg(self.lane_state_start[lane], ss + 2000, 2, f'Lane{lane} HS: {new_state}')
+            # Add transition markers for key state changes
+            if new_state == LANE_STATE_HS and old_state == LANE_STATE_LP_11:
+                self.putg(ss, ss + 10, 2, f'L{lane} HS Start')
+            elif new_state == LANE_STATE_HS_TRAIL and old_state == LANE_STATE_HS:
+                self.putg(ss, ss + 10, 2, f'L{lane} Packet End')
+            elif new_state == LANE_STATE_LP_11 and old_state == LANE_STATE_HS_TRAIL:
+                self.putg(ss, ss + 10, 2, f'L{lane} HS End')
 
             # Track transitions to HS state for lane detection
-            if new_state in [LANE_STATE_HS_0, LANE_STATE_HS_1, LANE_STATE_HS_SYNC]:
+            if new_state in [LANE_STATE_HS, LANE_STATE_HS_SYNC]:
                 self.lane_transition_count[lane] += 1
 
                 # Record when lane first started showing activity
@@ -317,7 +387,7 @@ class Decoder(srd.Decoder):
 
         if active_lanes != self.detected_lanes:
             self.detected_lanes = active_lanes
-            print(f"DEBUG: Detected {self.detected_lanes} active lanes: {', '.join(lane_details)}")
+            # print(f"DEBUG: Detected {self.detected_lanes} active lanes: {', '.join(lane_details)}")
             self.putg(self.samplenum, self.samplenum + 1, 11, f'Detected: {self.detected_lanes} lanes')
             self.putp(self.samplenum, self.samplenum + 1, ['LANE_COUNT', [self.detected_lanes]])
 
@@ -327,54 +397,125 @@ class Decoder(srd.Decoder):
             return
 
         # Shift in the new bit (LSB first - MIPI CSI-2 standard)
-        # For LSB first: new bit goes to the rightmost position
         self.bit_shifters[lane] = (self.bit_shifters[lane] >> 1) | (bit_value << 7)
         self.bit_counters[lane] += 1
 
-        # Annotate bit shifting
-        self.putg(ss, ss + 1, 12, f'Lane{lane}: {bit_value}')
-
-        # Check for sync byte when we have 8 bits
-        if self.bit_counters[lane] >= 8:
+        if not self.sync_detected[lane]:
             byte_value = self.bit_shifters[lane] & 0xFF
-            self.bit_shifters[lane] = 0
-            self.bit_counters[lane] = 0
+            # self.bit_counters[lane] = 0  # Reset counter for next byte
 
-            print(f"DEBUG: Lane{lane}: 0x{byte_value:02X}")
-            # Check for sync byte (try both 0xAB and 0x55)
-            if (byte_value == SYNC_MARKER ) and not self.sync_detected[lane]:
+            print(f"DEBUG: Lane{lane}: Pre-sync Byte 0x{byte_value:02X}")
+        else:
+            if self.bit_counters[lane] >= 8:
+                byte_value = self.bit_shifters[lane] & 0xFF
+                self.bit_shifters[lane] = 0  # Reset for next byte
+                self.bit_counters[lane] = 0  # Reset counter for next byte
+                print(f"DEBUG: Lane{lane}: Post-sync Byte 0x{byte_value:02X}")
+
+                self.process_packet_byte(lane, byte_value, ss)
+
+        # Check for sync byte detection - look for 0xB8 or start processing after seeing non-zero data
+        if not self.sync_detected[lane]:
+            if byte_value == SYNC_MARKER:
                 self.sync_detected[lane] = True
-                self.lane_sync_detected[lane] = True  # Mark lane as having sync
+                self.lane_sync_detected[lane] = True
+                self.byte_synchronized[lane] = True
+                self.bit_counters[lane] = 0  # Reset bit counter after sync
+                self.packet_state = 'COLLECTING_PACKET'
+                self.packet_buffer = []
                 self.putg(ss - 7, ss + 1, 13, f'Lane{lane}: SYNC 0x{byte_value:02X}')
                 self.putp(ss - 7, ss + 1, ['SYNC', None])
-                print(f"DEBUG: Sync byte detected on lane {lane}: 0x{byte_value:02X}")
+                print(f"DEBUG: Sync detected on lane {lane}: 0x{byte_value:02X}")
+                return
 
-            # Add to byte buffer
-            self.byte_buffers[lane].append(byte_value)
+    def process_packet_byte(self, lane, byte_value, ss):
+        """Process a complete byte in packet context"""
+        print(f"DEBUG: Processing packet byte 0x{byte_value:02X} on lane {lane}, state: {self.packet_state}")
 
-            # Process complete bytes
-            self.process_lane_bytes(lane, ss)
+        # After sync detection, we expect packet data (DataID is first byte)
+        if self.packet_state == 'COLLECTING_PACKET':
+            # Add byte to packet buffer
+            self.packet_buffer.append(byte_value)
+            print(f"DEBUG: Added byte 0x{byte_value:02X} to packet buffer (length: {len(self.packet_buffer)})")
 
-    def process_lane_bytes(self, lane, ss):
-        """Process complete bytes from a lane"""
-        if not self.byte_buffers[lane]:
-            return
+            # Check if we have enough bytes for a packet header (4 bytes minimum)
+            if len(self.packet_buffer) == 4:
+                word_count = self.analyze_packet_header(ss)
+                self.expected_packet_length = word_count
 
-        # Process all available bytes
-        while self.byte_buffers[lane]:
-            byte_val = self.byte_buffers[lane].pop(0)
+            # Check if we've received the complete packet based on expected length
+            if self.expected_packet_length > 0 and len(self.packet_buffer) >= self.expected_packet_length:
+                print(f"DEBUG: Packet complete - received {len(self.packet_buffer)} bytes, expected {self.expected_packet_length}")
+                self.process_complete_packet(ss)
+                self.packet_state = 'IDLE'
+                self.putg(ss - 7, ss + 1, 1, 'Packet Complete')
+                self.putp(ss - 7, ss + 1, ['PACKET_COMPLETE', None])
+                # Mark packet end detected for triggering HS-TRAIL state
+                for l in range(4):
+                    if self.byte_synchronized[l]:
+                        self.packet_end_detected[l] = True
+                # Reset for next packet
+                self.packet_buffer = []
+                self.expected_packet_length = 0
 
-            # Check for markers
-            if byte_val == SOT_MARKER:
-                self.decode_sot(ss - 8, ss + 1)
-            elif byte_val == EOT_MARKER:
-                self.decode_eot(ss - 8, ss + 1)
-            elif byte_val == SYNC_MARKER:
-                # Already handled in shift_bits
-                pass
+    def analyze_packet_header(self, ss):
+        """Analyze packet header to determine packet type and length"""
+        if len(self.packet_buffer) < 4:
+            return 0
+
+        # First 4 bytes form the packet header (after sync byte 0xB8)
+        # CSI-2 packet format: [DataID, Data_Byte1, Data_Byte2, ECC]
+        header = self.packet_buffer[:4]
+        data_id = header[0]  # DataID contains the actual data type
+        data_type = data_id  # For short packets, DataID IS the data type
+        virtual_channel = 0  # VC is typically 0 for basic packets, or embedded in DataID upper bits
+        data_field = (header[2] << 8) | header[1]  # 16-bit data field from data bytes
+
+        print(f"DEBUG: Header analysis - DataID: 0x{data_id:02X} (DT: 0x{data_type:02X}), Data: 0x{data_field:04X}, ECC: 0x{header[3]:02X}")
+
+        # Determine packet type based on data type value
+        # Data types 0x00-0x07 and 0x08-0x0F are typically short packets
+        # Data types 0x10+ are typically long packets (image data)
+        if data_type <= 0x0F:
+            # Short packet - always exactly 4 bytes total
+            print(f"DEBUG: Short packet detected - DT: 0x{data_type:02X}")
+            word_count = 4  # Short packets are always 4 bytes
+            # Create properly formatted header for decode function: [DataID, VC+DT, Data_Low, Data_High]
+            formatted_header = [data_id, (virtual_channel << 6) | data_type, header[1], header[2]]
+            self.decode_short_packet(ss, formatted_header)
+            return word_count
+        else:
+            # Long packet - the data field is actually word count for long packets
+            word_count = 4 + data_field + 2  # header + payload + checksum
+            print(f"DEBUG: Long packet detected, expecting {data_field} payload bytes + 2 checksum bytes (total: {word_count})")
+            return word_count
+
+
+    def process_complete_packet(self, ss):
+        """Process a complete packet when EOT is received"""
+        if len(self.packet_buffer) >= 4:
+            header = self.packet_buffer[:4]
+            # Use the same parsing logic as analyze_packet_header
+            data_id = header[0]  # DataID contains the actual data type
+            data_type = data_id  # For short packets, DataID IS the data type
+
+            # For short packets (DT 0x00-0x0F), there's no separate word count
+            # The packet is always exactly 4 bytes: [DataID, Data1, Data2, ECC]
+            if data_type <= 0x0F:
+                # Short packet - already processed in analyze_packet_header, no need to reprocess
+                print(f"DEBUG: Short packet complete - DT: 0x{data_type:02X}")
             else:
-                # Regular data byte
-                self.packet_data.append(byte_val)
+                # Long packet - use data bytes as word count
+                word_count = (header[2] << 8) | header[1]  # Use data bytes as word count for long packets
+                if len(self.packet_buffer) >= 4 + word_count + 2:
+                    payload = self.packet_buffer[4:4+word_count]
+                    checksum = self.packet_buffer[4+word_count:4+word_count+2]
+                    self.decode_long_packet(ss, header, payload, checksum)
+                else:
+                    print(f"DEBUG: Incomplete long packet - expected {4+word_count+2} bytes, got {len(self.packet_buffer)}")
+
+        self.packet_buffer = []
+        self.packet_state = 'SYNC_DETECTED'  # Ready for next packet
 
     def decode_sot(self, ss, es):
         """Decode Start of Transmission marker"""
@@ -397,50 +538,77 @@ class Decoder(srd.Decoder):
         self.putp(ss, es, ['SYNC', None])
         self.putg(ss, es, 2, 'SYNC')
 
-    def decode_short_packet(self, ss, es, data):
-        """Decode short packet header"""
-        if len(data) < 4:
-            self.putg(ss, es, 7, f'Short packet too short: {len(data)} bytes')
+    def decode_short_packet(self, ss, header):
+        """Decode short packet with proper CSI-2 format"""
+        if len(header) < 4:
+            self.putg(ss, ss + 32, 7, f'Short packet too short: {len(header)} bytes')
             return
 
-        data_type = data[0]
-        virtual_channel = data[1] & 0x03
-        payload_data = data[2:4]
+        data_id = header[0]
+        vc_dt = header[1]
+        virtual_channel = (vc_dt >> 6) & 0x03  # Upper 2 bits
+        data_type = vc_dt & 0x3F  # Lower 6 bits
+        data_field = (header[3] << 8) | header[2]  # 16-bit data field (little endian)
 
-        dt_name = DATA_TYPE_NAMES.get(data_type, f'Unknown({data_type:02X})')
+        # Decode short packet types based on CSI-2 specification
+        packet_info = self.decode_short_packet_type(data_type, data_field)
 
-        self.putp(ss, es, ['SHORT_PACKET', [data_type, virtual_channel, payload_data]])
-        self.putg(ss, es, 3, f'Short: {dt_name} VC{virtual_channel}')
-        self.putg(ss, es, 8, f'DT: {dt_name}')
-        self.putg(ss, es, 9, f'VC: {virtual_channel}')
+        dt_name = DATA_TYPE_NAMES.get(data_type, f'0x{data_type:02X}')
 
-        # Binary output
-        self.putb(ss, es, data)
+        # TODO: adjust time for lane count
+        self.putp(ss-30, ss, ['SHORT_PACKET', [data_type, virtual_channel, data_field]])
+        self.putg(ss-30, ss, 3, f'Short: {packet_info} VC{virtual_channel}')
+        self.putg(ss-30, ss, 8, f'DT: {dt_name}')
+        self.putg(ss-30, ss, 9, f'VC: {virtual_channel}')
 
-    def decode_long_packet(self, ss, es, data):
-        """Decode long packet header"""
-        if len(data) < 6:
-            self.putg(ss, es, 7, f'Long packet too short: {len(data)} bytes')
-            return
-
-        data_type = data[0]
-        virtual_channel = data[1] & 0x03
-        frame_count = data[2]
-        line_count = (data[3] << 8) | data[4]
-        pixel_count = (data[5] << 8) | data[6] if len(data) > 6 else 0
-
-        dt_name = DATA_TYPE_NAMES.get(data_type, f'Unknown({data_type:02X})')
-
-        self.putp(ss, es, ['LONG_PACKET', [data_type, virtual_channel, frame_count, line_count, pixel_count]])
-        self.putg(ss, es, 4, f'Long: {dt_name} VC{virtual_channel}')
-        self.putg(ss, es, 8, f'DT: {dt_name}')
-        self.putg(ss, es, 9, f'VC: {virtual_channel}')
-        self.putg(ss, es, 10, f'Frame: {frame_count}')
-        self.putg(ss, es, 11, f'Line: {line_count}')
-        self.putg(ss, es, 12, f'Pixel: {pixel_count}')
+        print(f"DEBUG: Short packet decoded - DT: 0x{data_type:02X} ({packet_info}), VC: {virtual_channel}, Data: 0x{data_field:04X}")
 
         # Binary output
-        self.putb(ss, es, data)
+        self.putb(ss, ss + 32, header)
+
+    def decode_short_packet_type(self, data_type, data_field):
+        """Decode specific short packet types according to CSI-2 spec"""
+        # Short packet data types (from CSI-2 spec)
+        short_packet_types = {
+            0x00: f"Frame Start (Frame: {data_field})",
+            0x01: f"Frame End (Frame: {data_field})",
+            0x02: f"Line Start (Line: {data_field})",
+            0x03: f"Line End (Line: {data_field})",
+            0x08: f"Generic Short 1 (Data: 0x{data_field:04X})",
+            0x09: f"Generic Short 2 (Data: 0x{data_field:04X})",
+            0x0A: f"Generic Short 3 (Data: 0x{data_field:04X})",
+            0x0B: f"Generic Short 4 (Data: 0x{data_field:04X})",
+            0x0C: f"Generic Short 5 (Data: 0x{data_field:04X})",
+            0x0D: f"Generic Short 6 (Data: 0x{data_field:04X})",
+            0x0E: f"Generic Short 7 (Data: 0x{data_field:04X})",
+            0x0F: f"Generic Short 8 (Data: 0x{data_field:04X})",
+        }
+
+        return short_packet_types.get(data_type, f"Unknown Short (0x{data_type:02X}, Data: 0x{data_field:04X})")
+
+    def decode_long_packet(self, ss, header, payload, checksum):
+        """Decode long packet with payload and checksum"""
+        # Use the same parsing logic as analyze_packet_header for consistency
+        # CSI-2 long packet format: [DataID, WC_Low, WC_High, ECC]
+        data_id = header[0]  # DataID contains the actual data type
+        data_type = data_id  # For long packets, DataID IS the data type
+        virtual_channel = 0  # VC is typically 0 for basic packets, or embedded in DataID upper bits
+        word_count = (header[2] << 8) | header[1]  # Word count from data bytes
+        ecc = header[3]  # Error correction code
+
+        dt_name = DATA_TYPE_NAMES.get(data_type, f'0x{data_type:02X}')
+
+        self.putp(ss - (32 + (len(payload) * 8) + 16), ss, ['LONG_PACKET', [data_type, virtual_channel, word_count, payload]])
+        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 3, f'Long: {dt_name} VC{virtual_channel} WC:{word_count}')
+        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 8, f'DT: {dt_name}')
+        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 9, f'VC: {virtual_channel}')
+
+        if payload:
+            self.putg(ss - (len(payload) * 8), ss, 5, f'Payload: {len(payload)} bytes')
+            self.putb(ss - (len(payload) * 8), ss, payload)
+
+        print(f"DEBUG: Long packet decoded - DT: 0x{data_type:02X} ({dt_name}), VC: {virtual_channel}, WC: {word_count}, ECC: 0x{ecc:02X}, Payload: {len(payload)} bytes")
+
 
     def decode_payload(self, ss, es, data):
         """Decode packet payload"""
@@ -463,35 +631,41 @@ class Decoder(srd.Decoder):
     def decode(self):
         """Main decode function with state machine and serial bit shifting"""
         while True:
-            # Wait for clock edge on clk_p
-            pins = self.wait({0: 'e'})
+            # Wait for any signal change, not just clock edges
+            pins = self.wait({0: 'e'})  # Wait for clock edge
+            ss = self.samplenum  # Test without scaling
+            # print(f"DEBUG: RAW samplenum={self.samplenum}, SCALED sample={ss}, Pins: {pins}")
 
-            # Extract the channels we need (simplified for positive signals only)
-            if len(pins) >= 5:
-                clk_p, data0_p, data1_p, data2_p, data3_p = pins[0:5]
-            else:
-                # Fallback if fewer channels are available
-                clk_p = pins[0] if len(pins) > 0 else None
-                data0_p = pins[1] if len(pins) > 1 else None
-                data1_p = pins[2] if len(pins) > 2 else None
-                data2_p = pins[3] if len(pins) > 3 else None
-                data3_p = pins[4] if len(pins) > 4 else None
+
+            # Extract differential channels (clk_p, clk_n, data0_p, data0_n, ...)
+            clk_n = pins[0] if len(pins) > 0 else None
+            clk_p = pins[1] if len(pins) > 1 else None
+            data0_n = pins[2] if len(pins) > 2 else None
+            data0_p = pins[3] if len(pins) > 3 else None
+            data1_n = pins[4] if len(pins) > 4 else None
+            data1_p = pins[5] if len(pins) > 5 else None
+            data2_n = pins[6] if len(pins) > 6 else None
+            data2_p = pins[7] if len(pins) > 7 else None
+            data3_n = pins[8] if len(pins) > 8 else None
+            data3_p = pins[9] if len(pins) > 9 else None
 
             # Process each lane
-            data_lanes = [data0_p, data1_p, data2_p, data3_p]
+            data_lanes_p = [data0_p, data1_p, data2_p, data3_p]
+            data_lanes_n = [data0_n, data1_n, data2_n, data3_n]
 
             for lane in range(4):
-                data_p = data_lanes[lane]
+                data_p = data_lanes_p[lane]
+                data_n = data_lanes_n[lane]
                 if data_p is not None:
                     # Detect lane state using single-ended signals
-                    lane_state = self.detect_lane_state(lane, data_p)
-                    self.update_lane_state(lane, lane_state, self.samplenum)
+                    lane_state = self.detect_lane_state(lane, data_p, data_n)
+                    self.update_lane_state(lane, lane_state, ss)
                     # print(f"DEBUG: Lane {lane} state: {lane_state}")
 
-                    # If in HS state, shift bits (process on all lanes to detect sync)
-                    if lane_state in [LANE_STATE_HS_0, LANE_STATE_HS_1]:
-                        bit_value = 1 if lane_state == LANE_STATE_HS_1 else 0
-                        self.shift_bits(lane, bit_value, self.samplenum)
+                    # If in HS or THS-SETTLE state, shift bits (process on all lanes to detect sync)
+                    if lane_state in [LANE_STATE_HS, LANE_STATE_THS_SETTLE]:
+                        bit_value = 1 if data_p > data_n else 0
+                        self.shift_bits(lane, bit_value, ss)
 
             # Use detected lane count if auto-detect is enabled
             active_lanes = self.detected_lanes if self.num_lanes == 0 else self.num_lanes
