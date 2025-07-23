@@ -482,7 +482,7 @@ class Decoder(srd.Decoder):
             word_count = 4  # Short packets are always 4 bytes
             # Create properly formatted header for decode function: [DataID, VC+DT, Data_Low, Data_High]
             formatted_header = [data_id, (virtual_channel << 6) | data_type, header[1], header[2]]
-            self.decode_short_packet_new(ss, formatted_header)
+            self.decode_short_packet(ss, formatted_header)
             return word_count
         else:
             # Long packet - the data field is actually word count for long packets
@@ -498,7 +498,7 @@ class Decoder(srd.Decoder):
             # Use the same parsing logic as analyze_packet_header
             data_id = header[0]  # DataID contains the actual data type
             data_type = data_id  # For short packets, DataID IS the data type
-            
+
             # For short packets (DT 0x00-0x0F), there's no separate word count
             # The packet is always exactly 4 bytes: [DataID, Data1, Data2, ECC]
             if data_type <= 0x0F:
@@ -510,7 +510,7 @@ class Decoder(srd.Decoder):
                 if len(self.packet_buffer) >= 4 + word_count + 2:
                     payload = self.packet_buffer[4:4+word_count]
                     checksum = self.packet_buffer[4+word_count:4+word_count+2]
-                    self.decode_long_packet_new(ss, header, payload, checksum)
+                    self.decode_long_packet(ss, header, payload, checksum)
                 else:
                     print(f"DEBUG: Incomplete long packet - expected {4+word_count+2} bytes, got {len(self.packet_buffer)}")
 
@@ -538,27 +538,7 @@ class Decoder(srd.Decoder):
         self.putp(ss, es, ['SYNC', None])
         self.putg(ss, es, 2, 'SYNC')
 
-    def decode_short_packet(self, ss, es, data):
-        """Decode short packet header"""
-        if len(data) < 4:
-            self.putg(ss, es, 7, f'Short packet too short: {len(data)} bytes')
-            return
-
-        data_type = data[0]
-        virtual_channel = data[1] & 0x03
-        payload_data = data[2:4]
-
-        dt_name = DATA_TYPE_NAMES.get(data_type, f'Unknown({data_type:02X})')
-
-        self.putp(ss, es, ['SHORT_PACKET', [data_type, virtual_channel, payload_data]])
-        self.putg(ss, es, 3, f'Short: {dt_name} VC{virtual_channel}')
-        self.putg(ss, es, 8, f'DT: {dt_name}')
-        self.putg(ss, es, 9, f'VC: {virtual_channel}')
-
-        # Binary output
-        self.putb(ss, es, data)
-
-    def decode_short_packet_new(self, ss, header):
+    def decode_short_packet(self, ss, header):
         """Decode short packet with proper CSI-2 format"""
         if len(header) < 4:
             self.putg(ss, ss + 32, 7, f'Short packet too short: {len(header)} bytes')
@@ -575,10 +555,11 @@ class Decoder(srd.Decoder):
 
         dt_name = DATA_TYPE_NAMES.get(data_type, f'0x{data_type:02X}')
 
-        self.putp(ss, ss + 32, ['SHORT_PACKET', [data_type, virtual_channel, data_field]])
-        self.putg(ss, ss + 32, 3, f'Short: {packet_info} VC{virtual_channel}')
-        self.putg(ss, ss + 32, 8, f'DT: {dt_name}')
-        self.putg(ss, ss + 32, 9, f'VC: {virtual_channel}')
+        # TODO: adjust time for lane count
+        self.putp(ss-30, ss, ['SHORT_PACKET', [data_type, virtual_channel, data_field]])
+        self.putg(ss-30, ss, 3, f'Short: {packet_info} VC{virtual_channel}')
+        self.putg(ss-30, ss, 8, f'DT: {dt_name}')
+        self.putg(ss-30, ss, 9, f'VC: {virtual_channel}')
 
         print(f"DEBUG: Short packet decoded - DT: 0x{data_type:02X} ({packet_info}), VC: {virtual_channel}, Data: 0x{data_field:04X}")
 
@@ -605,51 +586,29 @@ class Decoder(srd.Decoder):
 
         return short_packet_types.get(data_type, f"Unknown Short (0x{data_type:02X}, Data: 0x{data_field:04X})")
 
-    def decode_long_packet_new(self, ss, header, payload, checksum):
+    def decode_long_packet(self, ss, header, payload, checksum):
         """Decode long packet with payload and checksum"""
-        data_id = header[0]
-        vc_dt = header[1]
-        virtual_channel = (vc_dt >> 6) & 0x03
-        data_type = vc_dt & 0x3F
-        word_count = (header[3] << 8) | header[2]
+        # Use the same parsing logic as analyze_packet_header for consistency
+        # CSI-2 long packet format: [DataID, WC_Low, WC_High, ECC]
+        data_id = header[0]  # DataID contains the actual data type
+        data_type = data_id  # For long packets, DataID IS the data type
+        virtual_channel = 0  # VC is typically 0 for basic packets, or embedded in DataID upper bits
+        word_count = (header[2] << 8) | header[1]  # Word count from data bytes
+        ecc = header[3]  # Error correction code
 
         dt_name = DATA_TYPE_NAMES.get(data_type, f'0x{data_type:02X}')
 
-        self.putp(ss, ss + 32 + len(payload) + 16, ['LONG_PACKET', [data_type, virtual_channel, word_count, payload]])
-        self.putg(ss, ss + 32, 4, f'Long: {dt_name} VC{virtual_channel} WC:{word_count}')
-        self.putg(ss, ss + 32, 8, f'DT: {dt_name}')
-        self.putg(ss, ss + 32, 9, f'VC: {virtual_channel}')
+        self.putp(ss - (32 + (len(payload) * 8) + 16), ss, ['LONG_PACKET', [data_type, virtual_channel, word_count, payload]])
+        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 3, f'Long: {dt_name} VC{virtual_channel} WC:{word_count}')
+        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 8, f'DT: {dt_name}')
+        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 9, f'VC: {virtual_channel}')
 
         if payload:
-            self.putg(ss + 32, ss + 32 + len(payload) * 8, 5, f'Payload: {len(payload)} bytes')
-            self.putb(ss + 32, ss + 32 + len(payload) * 8, payload)
+            self.putg(ss - (len(payload) * 8), ss, 5, f'Payload: {len(payload)} bytes')
+            self.putb(ss - (len(payload) * 8), ss, payload)
 
-        print(f"DEBUG: Long packet decoded - DT: 0x{data_type:02X} ({dt_name}), VC: {virtual_channel}, WC: {word_count}, Payload: {len(payload)} bytes")
+        print(f"DEBUG: Long packet decoded - DT: 0x{data_type:02X} ({dt_name}), VC: {virtual_channel}, WC: {word_count}, ECC: 0x{ecc:02X}, Payload: {len(payload)} bytes")
 
-    def decode_long_packet(self, ss, es, data):
-        """Decode long packet header"""
-        if len(data) < 6:
-            self.putg(ss, es, 7, f'Long packet too short: {len(data)} bytes')
-            return
-
-        data_type = data[0]
-        virtual_channel = data[1] & 0x03
-        frame_count = data[2]
-        line_count = (data[3] << 8) | data[4]
-        pixel_count = (data[5] << 8) | data[6] if len(data) > 6 else 0
-
-        dt_name = DATA_TYPE_NAMES.get(data_type, f'Unknown({data_type:02X})')
-
-        self.putp(ss, es, ['LONG_PACKET', [data_type, virtual_channel, frame_count, line_count, pixel_count]])
-        self.putg(ss, es, 4, f'Long: {dt_name} VC{virtual_channel}')
-        self.putg(ss, es, 8, f'DT: {dt_name}')
-        self.putg(ss, es, 9, f'VC: {virtual_channel}')
-        self.putg(ss, es, 10, f'Frame: {frame_count}')
-        self.putg(ss, es, 11, f'Line: {line_count}')
-        self.putg(ss, es, 12, f'Pixel: {pixel_count}')
-
-        # Binary output
-        self.putb(ss, es, data)
 
     def decode_payload(self, ss, es, data):
         """Decode packet payload"""
