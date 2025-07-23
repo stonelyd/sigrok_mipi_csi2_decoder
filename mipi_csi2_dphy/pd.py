@@ -463,24 +463,26 @@ class Decoder(srd.Decoder):
         if len(self.packet_buffer) < 4:
             return 0
 
-        # First 4 bytes form the packet header
+        # First 4 bytes form the packet header (after sync byte 0xB8)
+        # CSI-2 packet format: [DataID, Data_Byte1, Data_Byte2, ECC]
         header = self.packet_buffer[:4]
-        data_id = header[0]
-        vc_dt = header[1]
-        virtual_channel = (vc_dt >> 6) & 0x03  # Upper 2 bits
-        data_type = vc_dt & 0x3F  # Lower 6 bits
-        data_field = (header[3] << 8) | header[2]  # 16-bit data field for short packets
+        data_id = header[0]  # DataID contains the actual data type
+        data_type = data_id  # For short packets, DataID IS the data type
+        virtual_channel = 0  # VC is typically 0 for basic packets, or embedded in DataID upper bits
+        data_field = (header[2] << 8) | header[1]  # 16-bit data field from data bytes
 
-        print(f"DEBUG: Header analysis - DataID: 0x{data_id:02X}, VC: {virtual_channel}, DT: 0x{data_type:02X}, Data: 0x{data_field:04X}")
+        print(f"DEBUG: Header analysis - DataID: 0x{data_id:02X} (DT: 0x{data_type:02X}), Data: 0x{data_field:04X}, ECC: 0x{header[3]:02X}")
 
         # Determine packet type based on data type value
         # Data types 0x00-0x07 and 0x08-0x0F are typically short packets
         # Data types 0x10+ are typically long packets (image data)
-        if data_type <= 0x0F or data_field == 0:
+        if data_type <= 0x0F:
             # Short packet - always exactly 4 bytes total
             print(f"DEBUG: Short packet detected - DT: 0x{data_type:02X}")
             word_count = 4  # Short packets are always 4 bytes
-            self.decode_short_packet_new(ss, header)
+            # Create properly formatted header for decode function: [DataID, VC+DT, Data_Low, Data_High]
+            formatted_header = [data_id, (virtual_channel << 6) | data_type, header[1], header[2]]
+            self.decode_short_packet_new(ss, formatted_header)
             return word_count
         else:
             # Long packet - the data field is actually word count for long packets
@@ -493,15 +495,18 @@ class Decoder(srd.Decoder):
         """Process a complete packet when EOT is received"""
         if len(self.packet_buffer) >= 4:
             header = self.packet_buffer[:4]
-            vc_dt = header[1]
-            data_type = vc_dt & 0x3F
-            word_count = (header[3] << 8) | header[2]
-
-            if word_count == 0:
-                # Short packet
-                self.decode_short_packet_new(ss, header)
+            # Use the same parsing logic as analyze_packet_header
+            data_id = header[0]  # DataID contains the actual data type
+            data_type = data_id  # For short packets, DataID IS the data type
+            
+            # For short packets (DT 0x00-0x0F), there's no separate word count
+            # The packet is always exactly 4 bytes: [DataID, Data1, Data2, ECC]
+            if data_type <= 0x0F:
+                # Short packet - already processed in analyze_packet_header, no need to reprocess
+                print(f"DEBUG: Short packet complete - DT: 0x{data_type:02X}")
             else:
-                # Long packet with payload
+                # Long packet - use data bytes as word count
+                word_count = (header[2] << 8) | header[1]  # Use data bytes as word count for long packets
                 if len(self.packet_buffer) >= 4 + word_count + 2:
                     payload = self.packet_buffer[4:4+word_count]
                     checksum = self.packet_buffer[4+word_count:4+word_count+2]

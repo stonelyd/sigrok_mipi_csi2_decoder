@@ -11,7 +11,7 @@ This is a sigrok protocol decoder for MIPI CSI-2 D-PHY, implementing high-speed 
 ### Testing
 ```bash
 # Test with sigrok-cli using VCD files (requires SIGROKDECODE_DIR environment variable)
-timeout 10s bash -c 'export SIGROKDECODE_DIR=/home/stonelyd/sigrok_mipi_decoder && sigrok-cli --input-file test_csi2_500ps.vcd --channels clk_p,data0_p,data1_p,data2_p,data3_p -P mipi_csi2_dphy --loglevel 5'
+timeout 60s bash -c 'SIGROKDECODE_DIR=/home/stonelyd/sigrok_mipi_csi2_decoder sigrok-cli --input-file test_csi2_500ps.vcd --channels clk_n,clk_p,data0_n,data0_p,data1_n,data1_p,data2_n,data2_p,data3_n,data3_p -P mipi_csi2_dphy --loglevel 5'
 
 ```
 ## Mipi csi-2 specifications.
