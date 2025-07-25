@@ -20,6 +20,7 @@ substitue vcd_file for test vectors
 test_csi2_frame_end_500ps.vcd -> Frame End Short Packet, 1 lane, vc=0
 test_csi2_frame_start_500ps.vcd -> Frame Start Short Packet, 1 lane, vc=0
 test_csi2_long_packet_500ps.vcd -> Raw8 long Packet, 1 lane, 32 bytes, vc=0
+test_csi2_frame_500ps.vcd -> Full Frame test with short and long packets.
 
 ## Mipi csi-2 specifications.
 
