@@ -457,6 +457,11 @@ class Decoder(srd.Decoder):
                 # Reset for next packet
                 self.packet_buffer = []
                 self.expected_packet_length = 0
+                # Reset sync detection to allow detection of next packet's sync byte
+                for l in range(4):
+                    if self.byte_synchronized[l]:
+                        self.sync_detected[l] = False
+                        print(f"DEBUG: Reset sync_detected for lane {l} after packet completion")
 
     def analyze_packet_header(self, ss):
         """Analyze packet header to determine packet type and length"""
