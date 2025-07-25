@@ -154,6 +154,7 @@ class Decoder(srd.Decoder):
         ('lane1-sync', 'Lane 1 sync byte'),
         ('lane2-sync', 'Lane 2 sync byte'),
         ('lane3-sync', 'Lane 3 sync byte'),
+        ('pixel-data', 'Decoded pixel data'),
     )
 
     # Annotation rows for grouping
@@ -165,6 +166,7 @@ class Decoder(srd.Decoder):
         ('lane1-info', 'Lane 1', (11, 15)),
         ('lane2-info', 'Lane 2', (12, 16)),
         ('lane3-info', 'Lane 3', (13, 17)),
+        ('pixel-data', 'Pixel Data', (18,)),
     )
 
     # Binary outputs
@@ -606,6 +608,69 @@ class Decoder(srd.Decoder):
 
         return short_packet_types.get(data_type, f"Unknown Short (0x{data_type:02X}, Data: 0x{data_field:04X})")
 
+    def decode_pixel_data(self, ss, es, data_type, payload):
+        """Decode pixel data from long packet payload based on data type"""
+        if not payload or len(payload) < 1:
+            return
+        
+        # Calculate time per byte for individual pixel annotations
+        # The payload time span (es - ss) represents the actual time used by the payload
+        # Individual pixels should be distributed across this full time span
+        total_time = es - ss
+        
+        if data_type == CSI2_DT_RAW8:
+            # RAW8: 1 byte per pixel
+            for i in range(len(payload)):
+                pixel_value = payload[i]
+                pixel_start = ss + (i * total_time) // len(payload)
+                pixel_end = ss + ((i + 1) * total_time) // len(payload)
+                self.putg(pixel_start, pixel_end, 18, f"{pixel_value:02X}")
+        elif data_type == CSI2_DT_RAW10:
+            # RAW10: 5 bytes contain 4 pixels (10 bits each, packed)
+            for i in range(0, len(payload), 5):
+                if i + 5 <= len(payload):
+                    # Unpack 4 pixels from 5 bytes
+                    # RAW10 format: 4 pixels packed into 5 bytes
+                    # Bytes: [P0[9:2], P1[9:2], P2[9:2], P3[9:2], P3[1:0]P2[1:0]P1[1:0]P0[1:0]]
+                    b0, b1, b2, b3, b4 = payload[i:i+5]
+                    pixels = [
+                        (b0 << 2) | ((b4 >> 6) & 0x03),  # P0: high 8 bits + low 2 bits
+                        (b1 << 2) | ((b4 >> 4) & 0x03),  # P1: high 8 bits + low 2 bits
+                        (b2 << 2) | ((b4 >> 2) & 0x03),  # P2: high 8 bits + low 2 bits
+                        (b3 << 2) | (b4 & 0x03)          # P3: high 8 bits + low 2 bits
+                    ]
+                    # Annotate each of the 4 pixels from this 5-byte group
+                    for j, pixel_value in enumerate(pixels):
+                        # Calculate time position based on pixel index within the group
+                        pixel_idx = (i // 5) * 4 + j
+                        total_pixels = (len(payload) // 5) * 4
+                        pixel_start = ss + (pixel_idx * total_time) // total_pixels
+                        pixel_end = ss + ((pixel_idx + 1) * total_time) // total_pixels
+                        self.putg(pixel_start, pixel_end, 18, f"{pixel_value:03X}")
+        elif data_type == CSI2_DT_RGB888:
+            # RGB888: 3 bytes per pixel (R, G, B)
+            for i in range(0, len(payload), 3):
+                if i + 2 < len(payload):
+                    r, g, b = payload[i:i+3]
+                    # Create annotation spanning the 3 bytes for this pixel
+                    pixel_start = ss + (i * total_time) // len(payload)
+                    pixel_end = ss + ((i + 3) * total_time) // len(payload)
+                    self.putg(pixel_start, pixel_end, 18, f"{r:02X}{g:02X}{b:02X}")
+        elif data_type == CSI2_DT_YUV422_8BIT:
+            # YUV422: 2 bytes per pixel (alternating Y/U/Y/V)
+            for i in range(0, len(payload), 2):
+                if i + 1 < len(payload):
+                    y, uv = payload[i:i+2]
+                    pixel_start = ss + (i * total_time) // len(payload)
+                    pixel_end = ss + ((i + 2) * total_time) // len(payload)
+                    self.putg(pixel_start, pixel_end, 18, f"{y:02X}{uv:02X}")
+        else:
+            # Generic hex dump for unknown formats - 1 byte per pixel
+            for i in range(len(payload)):
+                pixel_start = ss + (i * total_time) // len(payload)
+                pixel_end = ss + ((i + 1) * total_time) // len(payload)
+                self.putg(pixel_start, pixel_end, 18, f"{payload[i]:02X}")
+
     def decode_long_packet(self, ss, header, payload, checksum):
         """Decode long packet with payload and checksum"""
         # Use the same parsing logic as analyze_packet_header for consistency
@@ -617,26 +682,36 @@ class Decoder(srd.Decoder):
         ecc = header[3]  # Error correction code
 
         dt_name = DATA_TYPE_NAMES.get(data_type, f'0x{data_type:02X}')
+        
+        # Account for active lane count in timing calculations
+        # Use number of lanes with sync detected as fallback if lane detection hasn't triggered
+        sync_lanes_detected = sum(1 for lane_sync in self.lane_sync_detected if lane_sync)
+        active_lanes = max(1, self.detected_lanes if self.num_lanes == 0 else self.num_lanes)
+        if active_lanes == 1 and sync_lanes_detected > 1:
+            active_lanes = sync_lanes_detected
+        payload_time_per_lane = (len(payload) * 8) // active_lanes
+        header_time_per_lane = 32 // active_lanes  # 4 header bytes scaled for lanes
+        footer_time_per_lane = 16 // active_lanes  # 2 footer bytes scaled for lanes
 
-        self.putp(ss - (32 + (len(payload) * 8) + 16), ss, ['LONG_PACKET', [data_type, virtual_channel, word_count, payload]])
-        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 3, f'Long: {dt_name} VC{virtual_channel} WC:{word_count}')
-        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 8, f'DT: {dt_name}')
-        self.putg(ss - (32 + (len(payload) * 8)), ss - ((len(payload) * 8)), 9, f'VC: {virtual_channel}')
+        self.putp(ss - (header_time_per_lane + payload_time_per_lane + footer_time_per_lane), ss, ['LONG_PACKET', [data_type, virtual_channel, word_count, payload]])
+        self.putg(ss - (header_time_per_lane + payload_time_per_lane), ss - payload_time_per_lane, 3, f'Long: {dt_name} VC{virtual_channel} WC:{word_count}')
+        self.putg(ss - (header_time_per_lane + payload_time_per_lane), ss - payload_time_per_lane, 8, f'DT: {dt_name}')
+        self.putg(ss - (header_time_per_lane + payload_time_per_lane), ss - payload_time_per_lane, 9, f'VC: {virtual_channel}')
 
         if payload:
-            self.putg(ss - (len(payload) * 8), ss, 5, f'Payload: {len(payload)} bytes')
-            self.putb(ss - (len(payload) * 8), ss, payload)
+            self.putg(ss - payload_time_per_lane, ss, 5, f'Payload: {len(payload)} bytes')
+            self.putb(ss - payload_time_per_lane, ss, payload)
+            
+            # Decode pixel data from payload
+            self.decode_pixel_data(ss - payload_time_per_lane, ss, data_type, payload)
 
         # Annotate the footer/checksum (2 bytes at the end of long packets)
         if checksum:
             footer_start = ss
-            footer_end = ss + 16  # 2 bytes * 8 bits = 16 sample units
+            footer_end = ss + footer_time_per_lane
             self.putg(footer_start, footer_end, 6, f'Footer: {len(checksum)} bytes (0x{checksum[0]:02X}{checksum[1]:02X})')
             self.putp(footer_start, footer_end, ['FOOTER', checksum])
             self.putb(footer_start, footer_end, checksum)
-            print(f"DEBUG: Footer/checksum annotated - {len(checksum)} bytes: 0x{checksum[0]:02X}{checksum[1]:02X}")
-
-        print(f"DEBUG: Long packet decoded - DT: 0x{data_type:02X} ({dt_name}), VC: {virtual_channel}, WC: {word_count}, ECC: 0x{ecc:02X}, Payload: {len(payload)} bytes")
 
 
     def decode_payload(self, ss, es, data):
