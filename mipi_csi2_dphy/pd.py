@@ -146,19 +146,25 @@ class Decoder(srd.Decoder):
         ('error', 'Protocol error'),
         ('data-type', 'Data type'),
         ('virtual-channel', 'Virtual channel'),
-        ('lane-state', 'Lane state'),
-        ('lane-count', 'Detected lane count'),
-        ('bit-shift', 'Bit shifting'),
-        ('sync-byte', 'Sync byte detected'),
+        ('lane0-state', 'Lane 0 state'),
+        ('lane1-state', 'Lane 1 state'),
+        ('lane2-state', 'Lane 2 state'),
+        ('lane3-state', 'Lane 3 state'),
+        ('lane0-sync', 'Lane 0 sync byte'),
+        ('lane1-sync', 'Lane 1 sync byte'),
+        ('lane2-sync', 'Lane 2 sync byte'),
+        ('lane3-sync', 'Lane 3 sync byte'),
     )
 
     # Annotation rows for grouping
     annotation_rows = (
-        ('markers', 'Markers', (0, 1, 2)),
         ('packets', 'Packets', (3, 4, 5, 6)),
         ('errors', 'Errors', (7,)),
         ('metadata', 'Metadata', (8, 9)),
-        ('lane-info', 'Lane Information', (10, 11, 12, 13)),
+        ('lane0-info', 'Lane 0', (10, 14)),
+        ('lane1-info', 'Lane 1', (11, 15)),
+        ('lane2-info', 'Lane 2', (12, 16)),
+        ('lane3-info', 'Lane 3', (13, 17)),
     )
 
     # Binary outputs
@@ -228,7 +234,6 @@ class Decoder(srd.Decoder):
             self.num_lanes = 0  # Auto-detect
             self.expected_bitrate = 1000
 
-            self.putg(0, 1000, 0, 'MIPI CSI-2 D-PHY Decoder Started')
 
     def putg(self, ss, es, cls, text):
         self.put(ss, es, self.out_ann, [cls, [text]])
@@ -342,7 +347,7 @@ class Decoder(srd.Decoder):
 
             # Annotate the previous state duration
             if old_start is not None:
-                self.putg(old_start, ss, 10, f'L{lane}: {old_state}')
+                self.putg(old_start, ss, 10 + lane, f'L{lane}: {old_state}')
 
             # Update state tracking
             self.lane_states[lane] = new_state
@@ -351,11 +356,11 @@ class Decoder(srd.Decoder):
 
             # Add transition markers for key state changes
             if new_state == LANE_STATE_HS and old_state == LANE_STATE_LP_11:
-                self.putg(ss, ss + 10, 2, f'L{lane} HS Start')
+                pass  # HS Start transition
             elif new_state == LANE_STATE_HS_TRAIL and old_state == LANE_STATE_HS:
-                self.putg(ss, ss + 10, 2, f'L{lane} Packet End')
+                pass  # Packet End transition
             elif new_state == LANE_STATE_LP_11 and old_state == LANE_STATE_HS_TRAIL:
-                self.putg(ss, ss + 10, 2, f'L{lane} HS End')
+                pass  # HS End transition
 
             # Track transitions to HS state for lane detection
             if new_state in [LANE_STATE_HS, LANE_STATE_HS_SYNC]:
@@ -373,22 +378,36 @@ class Decoder(srd.Decoder):
         """Detect how many lanes are actually active"""
         active_lanes = 0
         lane_details = []
+        all_lane_info = []
+        
+        # First, gather info about all lanes for debugging
+        for lane in range(4):
+            transitions = self.lane_transition_count[lane]
+            has_sync = self.lane_sync_detected[lane]
+            start_time = self.lane_activity_start[lane]
+            duration = (self.samplenum - start_time) if start_time is not None else 0
+            all_lane_info.append(f"L{lane}:T{transitions}:S{int(has_sync)}:D{duration}")
+        
+        print(f"DEBUG: Lane activity analysis: {' | '.join(all_lane_info)}")
+        
         for lane in range(4):
             # A lane is considered active if it has sufficient transitions and sustained activity
-            # For now, focus on the most active lane (lane 0) and ignore others unless they have sync
             if (self.lane_transition_count[lane] >= self.lane_detection_threshold and
                 self.lane_activity_start[lane] is not None and
                 (self.samplenum - self.lane_activity_start[lane]) >= self.lane_activity_duration):
 
-                # Only count lane 0 as active by default, unless other lanes have both sync AND significant activity
-                if lane == 0 or (self.lane_sync_detected[lane] and self.lane_transition_count[lane] >= 50):
+                # Improved multi-lane detection logic:
+                # Lane 0: Always counted if it meets basic criteria (it typically carries sync)
+                # Other lanes: Count if they have significant activity (reduced threshold from 50 to 20)
+                if lane == 0 or self.lane_transition_count[lane] >= 20:
                     active_lanes += 1
-                    lane_details.append(f"Lane{lane}({self.lane_transition_count[lane]})")
+                    sync_status = "SYNC" if self.lane_sync_detected[lane] else "DATA"
+                    lane_details.append(f"Lane{lane}({self.lane_transition_count[lane]},{sync_status})")
+                    print(f"DEBUG: Lane {lane} counted as active - transitions: {self.lane_transition_count[lane]}, sync: {self.lane_sync_detected[lane]}")
 
         if active_lanes != self.detected_lanes:
             self.detected_lanes = active_lanes
-            # print(f"DEBUG: Detected {self.detected_lanes} active lanes: {', '.join(lane_details)}")
-            self.putg(self.samplenum, self.samplenum + 1, 11, f'Detected: {self.detected_lanes} lanes')
+            print(f"DEBUG: Detected {self.detected_lanes} active lanes: {', '.join(lane_details)}")
             self.putp(self.samplenum, self.samplenum + 1, ['LANE_COUNT', [self.detected_lanes]])
 
     def shift_bits(self, lane, bit_value, ss):
@@ -423,7 +442,7 @@ class Decoder(srd.Decoder):
                 self.bit_counters[lane] = 0  # Reset bit counter after sync
                 self.packet_state = 'COLLECTING_PACKET'
                 self.packet_buffer = []
-                self.putg(ss - 7, ss + 1, 13, f'Lane{lane}: SYNC 0x{byte_value:02X}')
+                self.putg(ss - 7, ss + 1, 14 + lane, f'Lane{lane}: SYNC 0x{byte_value:02X}')
                 self.putp(ss - 7, ss + 1, ['SYNC', None])
                 print(f"DEBUG: Sync detected on lane {lane}: 0x{byte_value:02X}")
                 return
@@ -448,7 +467,6 @@ class Decoder(srd.Decoder):
                 print(f"DEBUG: Packet complete - received {len(self.packet_buffer)} bytes, expected {self.expected_packet_length}")
                 self.process_complete_packet(ss)
                 self.packet_state = 'IDLE'
-                self.putg(ss - 7, ss + 1, 1, 'Packet Complete')
                 self.putp(ss - 7, ss + 1, ['PACKET_COMPLETE', None])
                 # Mark packet end detected for triggering HS-TRAIL state
                 for l in range(4):
@@ -529,19 +547,16 @@ class Decoder(srd.Decoder):
         self.packet_data = []
 
         self.putp(ss, es, ['SOT', None])
-        self.putg(ss, es, 0, 'SOT')
 
     def decode_eot(self, ss, es):
         """Decode End of Transmission marker"""
         self.state = 'IDLE'
 
         self.putp(ss, es, ['EOT', None])
-        self.putg(ss, es, 1, 'EOT')
 
     def decode_sync(self, ss, es):
         """Decode lane synchronization"""
         self.putp(ss, es, ['SYNC', None])
-        self.putg(ss, es, 2, 'SYNC')
 
     def decode_short_packet(self, ss, header):
         """Decode short packet with proper CSI-2 format"""
