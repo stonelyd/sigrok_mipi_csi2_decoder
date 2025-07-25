@@ -607,6 +607,15 @@ class Decoder(srd.Decoder):
             self.putg(ss - (len(payload) * 8), ss, 5, f'Payload: {len(payload)} bytes')
             self.putb(ss - (len(payload) * 8), ss, payload)
 
+        # Annotate the footer/checksum (2 bytes at the end of long packets)
+        if checksum:
+            footer_start = ss
+            footer_end = ss + 16  # 2 bytes * 8 bits = 16 sample units
+            self.putg(footer_start, footer_end, 6, f'Footer: {len(checksum)} bytes (0x{checksum[0]:02X}{checksum[1]:02X})')
+            self.putp(footer_start, footer_end, ['FOOTER', checksum])
+            self.putb(footer_start, footer_end, checksum)
+            print(f"DEBUG: Footer/checksum annotated - {len(checksum)} bytes: 0x{checksum[0]:02X}{checksum[1]:02X}")
+
         print(f"DEBUG: Long packet decoded - DT: 0x{data_type:02X} ({dt_name}), VC: {virtual_channel}, WC: {word_count}, ECC: 0x{ecc:02X}, Payload: {len(payload)} bytes")
 
 
