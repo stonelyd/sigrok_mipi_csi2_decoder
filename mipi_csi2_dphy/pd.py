@@ -191,6 +191,7 @@ class Decoder(srd.Decoder):
         self.state = 'IDLE'
         self.lane_states = [LANE_STATE_LP_11] * 4  # Track lane states
         self.lane_state_start = [0] * 4  # Track when each lane state started
+        self.lane_active_annotations = [None] * 4  # Track active state annotations for cleanup
         self.packet_start = None
         self.packet_data = []
         self.current_lane = 0
@@ -237,6 +238,10 @@ class Decoder(srd.Decoder):
             # Use defaults for testing
             self.num_lanes = 0  # Auto-detect
             self.expected_bitrate = 1000
+
+        # Initialize lane state annotations for the initial LP-11 state
+        for lane in range(4):
+            self.lane_active_annotations[lane] = 0  # Mark as having active annotation from start
 
 
     def putg(self, ss, es, cls, text):
@@ -341,7 +346,7 @@ class Decoder(srd.Decoder):
         return physical_state
 
     def update_lane_state(self, lane, new_state, ss):
-        """Update lane state and annotate if changed"""
+        """Update lane state and annotate if changed - annotate on entry approach"""
         if new_state is None:
             return
 
@@ -349,7 +354,7 @@ class Decoder(srd.Decoder):
             old_state = self.lane_states[lane]
             old_start = self.lane_state_start[lane]
 
-            # Annotate the previous state duration
+            # End the previous state annotation if one exists
             if old_start is not None:
                 self.putg(old_start, ss, 10 + lane, f'L{lane}: {old_state}')
 
@@ -358,10 +363,8 @@ class Decoder(srd.Decoder):
             self.lane_state_start[lane] = ss
             self.putp(ss, ss, ['LANE_STATE', [lane, new_state]])
 
-            # Immediately annotate LP-11 state to ensure it's always visible
-            if new_state == LANE_STATE_LP_11:
-                # Use a longer annotation period for LP-11 to ensure visibility
-                self.putg(ss, ss + 100, 10 + lane, f'L{lane}: LP-11')
+            # Mark that we have an active annotation for this lane
+            self.lane_active_annotations[lane] = ss
 
             # Add transition markers for key state changes
             if new_state == LANE_STATE_HS and old_state == LANE_STATE_THS_SETTLE:
@@ -369,8 +372,8 @@ class Decoder(srd.Decoder):
             elif new_state == LANE_STATE_HS_TRAIL and old_state == LANE_STATE_HS:
                 pass  # Packet End transition
             elif new_state == LANE_STATE_LP_11 and old_state == LANE_STATE_HS_TRAIL:
-                # HS End transition - annotate the return to LP-11
-                # self.putg(ss, ss + 1, 10 + lane, f'L{lane}: HS-END')
+                # HS End transition - add a short LP-11 annotation to ensure visibility
+                self.putg(ss, ss + 10, 10 + lane, f'L{lane}: LP-11')
 
             # Track transitions to HS state for lane detection
             if new_state in [LANE_STATE_HS, LANE_STATE_HS_SYNC]:
@@ -490,6 +493,8 @@ class Decoder(srd.Decoder):
                     if self.byte_synchronized[l]:
                         self.sync_detected[l] = False
                         print(f"DEBUG: Reset sync_detected for lane {l} after packet completion")
+                
+                # Note: Final LP-11 annotations will be handled by state machine
 
     def analyze_packet_header(self, ss):
         """Analyze packet header to determine packet type and length"""
@@ -759,6 +764,17 @@ class Decoder(srd.Decoder):
         """Decode protocol error"""
         self.putp(ss, es, ['ERROR', error_msg])
         self.putg(ss, es, 7, f'Error: {error_msg}')
+
+    def finalize_lane_annotations(self, final_sample):
+        """Finalize any remaining active lane state annotations"""
+        for lane in range(4):
+            if (self.lane_active_annotations[lane] is not None and 
+                self.lane_state_start[lane] is not None):
+                # End the current state annotation at the final sample
+                current_state = self.lane_states[lane]
+                start_sample = self.lane_state_start[lane]
+                self.putg(start_sample, final_sample, 10 + lane, f'L{lane}: {current_state}')
+                self.lane_active_annotations[lane] = None
 
     def decode(self):
         """Main decode function with state machine and serial bit shifting"""
