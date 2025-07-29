@@ -75,6 +75,7 @@ CSI2_DT_RAW8 = 0x2A
 CSI2_DT_RAW10 = 0x2B
 CSI2_DT_RAW12 = 0x2C
 CSI2_DT_RAW14 = 0x2D
+CSI2_DT_RAW16 = 0x2E
 CSI2_DT_JPEG = 0x30
 
 # Data type names mapping
@@ -94,6 +95,7 @@ DATA_TYPE_NAMES = {
     CSI2_DT_RAW10: 'RAW10',
     CSI2_DT_RAW12: 'RAW12',
     CSI2_DT_RAW14: 'RAW14',
+    CSI2_DT_RAW16: 'RAW16',
     CSI2_DT_JPEG: 'JPEG',
 }
 
@@ -356,13 +358,19 @@ class Decoder(srd.Decoder):
             self.lane_state_start[lane] = ss
             self.putp(ss, ss, ['LANE_STATE', [lane, new_state]])
 
+            # Immediately annotate LP-11 state to ensure it's always visible
+            if new_state == LANE_STATE_LP_11:
+                # Use a longer annotation period for LP-11 to ensure visibility
+                self.putg(ss, ss + 100, 10 + lane, f'L{lane}: LP-11')
+
             # Add transition markers for key state changes
-            if new_state == LANE_STATE_HS and old_state == LANE_STATE_LP_11:
+            if new_state == LANE_STATE_HS and old_state == LANE_STATE_THS_SETTLE:
                 pass  # HS Start transition
             elif new_state == LANE_STATE_HS_TRAIL and old_state == LANE_STATE_HS:
                 pass  # Packet End transition
             elif new_state == LANE_STATE_LP_11 and old_state == LANE_STATE_HS_TRAIL:
-                pass  # HS End transition
+                # HS End transition - annotate the return to LP-11
+                # self.putg(ss, ss + 1, 10 + lane, f'L{lane}: HS-END')
 
             # Track transitions to HS state for lane detection
             if new_state in [LANE_STATE_HS, LANE_STATE_HS_SYNC]:
@@ -381,7 +389,7 @@ class Decoder(srd.Decoder):
         active_lanes = 0
         lane_details = []
         all_lane_info = []
-        
+
         # First, gather info about all lanes for debugging
         for lane in range(4):
             transitions = self.lane_transition_count[lane]
@@ -389,9 +397,9 @@ class Decoder(srd.Decoder):
             start_time = self.lane_activity_start[lane]
             duration = (self.samplenum - start_time) if start_time is not None else 0
             all_lane_info.append(f"L{lane}:T{transitions}:S{int(has_sync)}:D{duration}")
-        
+
         print(f"DEBUG: Lane activity analysis: {' | '.join(all_lane_info)}")
-        
+
         for lane in range(4):
             # A lane is considered active if it has sufficient transitions and sustained activity
             if (self.lane_transition_count[lane] >= self.lane_detection_threshold and
@@ -612,12 +620,12 @@ class Decoder(srd.Decoder):
         """Decode pixel data from long packet payload based on data type"""
         if not payload or len(payload) < 1:
             return
-        
+
         # Calculate time per byte for individual pixel annotations
         # The payload time span (es - ss) represents the actual time used by the payload
         # Individual pixels should be distributed across this full time span
         total_time = es - ss
-        
+
         if data_type == CSI2_DT_RAW8:
             # RAW8: 1 byte per pixel
             for i in range(len(payload)):
@@ -647,6 +655,15 @@ class Decoder(srd.Decoder):
                         pixel_start = ss + (pixel_idx * total_time) // total_pixels
                         pixel_end = ss + ((pixel_idx + 1) * total_time) // total_pixels
                         self.putg(pixel_start, pixel_end, 18, f"{pixel_value:03X}")
+        elif data_type == CSI2_DT_RAW16:
+            # RAW16: 2 bytes per pixel (16 bits each, little endian)
+            for i in range(0, len(payload), 2):
+                if i + 1 < len(payload):
+                    # Combine two bytes into 16-bit pixel value (little endian)
+                    pixel_value = payload[i] | (payload[i + 1] << 8)
+                    pixel_start = ss + (i * total_time) // len(payload)
+                    pixel_end = ss + ((i + 2) * total_time) // len(payload)
+                    self.putg(pixel_start, pixel_end, 18, f"{pixel_value:04X}")
         elif data_type == CSI2_DT_RGB888:
             # RGB888: 3 bytes per pixel (R, G, B)
             for i in range(0, len(payload), 3):
@@ -657,13 +674,24 @@ class Decoder(srd.Decoder):
                     pixel_end = ss + ((i + 3) * total_time) // len(payload)
                     self.putg(pixel_start, pixel_end, 18, f"{r:02X}{g:02X}{b:02X}")
         elif data_type == CSI2_DT_YUV422_8BIT:
-            # YUV422: 2 bytes per pixel (alternating Y/U/Y/V)
-            for i in range(0, len(payload), 2):
-                if i + 1 < len(payload):
+            # YUV422: 4 bytes per 2 pixels (Y0/U0/Y1/V0 pattern)
+            for i in range(0, len(payload), 4):
+                if i + 3 < len(payload):
+                    y0, u, y1, v = payload[i:i+4]
+                    # First pixel (Y0/U)
+                    pixel_start = ss + (i * total_time) // len(payload)
+                    pixel_mid = ss + ((i + 2) * total_time) // len(payload)
+                    pixel_end = ss + ((i + 4) * total_time) // len(payload)
+                    self.putg(pixel_start, pixel_mid, 18, f"Y:{y0:02X} U:{u:02X}")
+                    # Second pixel (Y1/V)
+                    self.putg(pixel_mid, pixel_end, 18, f"Y:{y1:02X} V:{v:02X}")
+                elif i + 1 < len(payload):
+                    # Handle incomplete YUV422 data (fallback for odd cases)
                     y, uv = payload[i:i+2]
                     pixel_start = ss + (i * total_time) // len(payload)
                     pixel_end = ss + ((i + 2) * total_time) // len(payload)
-                    self.putg(pixel_start, pixel_end, 18, f"{y:02X}{uv:02X}")
+                    component = "U" if (i // 2) % 2 == 1 else "Y"
+                    self.putg(pixel_start, pixel_end, 18, f"Y:{y:02X} {component}:{uv:02X}")
         else:
             # Generic hex dump for unknown formats - 1 byte per pixel
             for i in range(len(payload)):
@@ -682,7 +710,7 @@ class Decoder(srd.Decoder):
         ecc = header[3]  # Error correction code
 
         dt_name = DATA_TYPE_NAMES.get(data_type, f'0x{data_type:02X}')
-        
+
         # Account for active lane count in timing calculations
         # Use number of lanes with sync detected as fallback if lane detection hasn't triggered
         sync_lanes_detected = sum(1 for lane_sync in self.lane_sync_detected if lane_sync)
@@ -701,7 +729,7 @@ class Decoder(srd.Decoder):
         if payload:
             self.putg(ss - payload_time_per_lane, ss, 5, f'Payload: {len(payload)} bytes')
             self.putb(ss - payload_time_per_lane, ss, payload)
-            
+
             # Decode pixel data from payload
             self.decode_pixel_data(ss - payload_time_per_lane, ss, data_type, payload)
 
