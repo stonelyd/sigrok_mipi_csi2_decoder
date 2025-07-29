@@ -75,6 +75,7 @@ CSI2_DT_RAW8 = 0x2A
 CSI2_DT_RAW10 = 0x2B
 CSI2_DT_RAW12 = 0x2C
 CSI2_DT_RAW14 = 0x2D
+CSI2_DT_RAW16 = 0x2E
 CSI2_DT_JPEG = 0x30
 
 # Data type names mapping
@@ -94,6 +95,7 @@ DATA_TYPE_NAMES = {
     CSI2_DT_RAW10: 'RAW10',
     CSI2_DT_RAW12: 'RAW12',
     CSI2_DT_RAW14: 'RAW14',
+    CSI2_DT_RAW16: 'RAW16',
     CSI2_DT_JPEG: 'JPEG',
 }
 
@@ -647,6 +649,15 @@ class Decoder(srd.Decoder):
                         pixel_start = ss + (pixel_idx * total_time) // total_pixels
                         pixel_end = ss + ((pixel_idx + 1) * total_time) // total_pixels
                         self.putg(pixel_start, pixel_end, 18, f"{pixel_value:03X}")
+        elif data_type == CSI2_DT_RAW16:
+            # RAW16: 2 bytes per pixel (16 bits each, little endian)
+            for i in range(0, len(payload), 2):
+                if i + 1 < len(payload):
+                    # Combine two bytes into 16-bit pixel value (little endian)
+                    pixel_value = payload[i] | (payload[i + 1] << 8)
+                    pixel_start = ss + (i * total_time) // len(payload)
+                    pixel_end = ss + ((i + 2) * total_time) // len(payload)
+                    self.putg(pixel_start, pixel_end, 18, f"{pixel_value:04X}")
         elif data_type == CSI2_DT_RGB888:
             # RGB888: 3 bytes per pixel (R, G, B)
             for i in range(0, len(payload), 3):
