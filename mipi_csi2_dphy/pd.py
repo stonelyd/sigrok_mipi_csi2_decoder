@@ -668,13 +668,24 @@ class Decoder(srd.Decoder):
                     pixel_end = ss + ((i + 3) * total_time) // len(payload)
                     self.putg(pixel_start, pixel_end, 18, f"{r:02X}{g:02X}{b:02X}")
         elif data_type == CSI2_DT_YUV422_8BIT:
-            # YUV422: 2 bytes per pixel (alternating Y/U/Y/V)
-            for i in range(0, len(payload), 2):
-                if i + 1 < len(payload):
+            # YUV422: 4 bytes per 2 pixels (Y0/U0/Y1/V0 pattern)
+            for i in range(0, len(payload), 4):
+                if i + 3 < len(payload):
+                    y0, u, y1, v = payload[i:i+4]
+                    # First pixel (Y0/U)
+                    pixel_start = ss + (i * total_time) // len(payload)
+                    pixel_mid = ss + ((i + 2) * total_time) // len(payload)
+                    pixel_end = ss + ((i + 4) * total_time) // len(payload)
+                    self.putg(pixel_start, pixel_mid, 18, f"Y:{y0:02X} U:{u:02X}")
+                    # Second pixel (Y1/V)
+                    self.putg(pixel_mid, pixel_end, 18, f"Y:{y1:02X} V:{v:02X}")
+                elif i + 1 < len(payload):
+                    # Handle incomplete YUV422 data (fallback for odd cases)
                     y, uv = payload[i:i+2]
                     pixel_start = ss + (i * total_time) // len(payload)
                     pixel_end = ss + ((i + 2) * total_time) // len(payload)
-                    self.putg(pixel_start, pixel_end, 18, f"{y:02X}{uv:02X}")
+                    component = "U" if (i // 2) % 2 == 1 else "Y"
+                    self.putg(pixel_start, pixel_end, 18, f"Y:{y:02X} {component}:{uv:02X}")
         else:
             # Generic hex dump for unknown formats - 1 byte per pixel
             for i in range(len(payload)):
