@@ -2,7 +2,7 @@
 import re
 
 # Read the original VCD file
-with open('test_csi2_long_packet_raw16_4lane.vcd', 'r') as f:
+with open('test_csi2_long_packet_yuv422_4lane.vcd', 'r') as f:
     content = f.read()
 
 # Change timescale from 1ps to 500ps
@@ -16,7 +16,7 @@ def scale_timestamp(match):
 content = re.sub(r'#(\d+)', scale_timestamp, content)
 
 # Write the converted VCD
-with open('test_csi2_long_packet_raw16_4lane_500ps.vcd', 'w') as f:
+with open('test_csi2_long_packet_yuv422_4lane_500ps.vcd', 'w') as f:
     f.write(content)
 
-print("Converted VCD with 500ps timescale created as test_csi2_long_packet_raw16_4lane_500ps.vcd")
+print("Converted VCD with 500ps timescale created as test_csi2_long_packet_yuv422_4lane_500ps.vcd")
